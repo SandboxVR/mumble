@@ -25,6 +25,7 @@ endif()
 if(server)
 	use_test("TestCrypt")
 	use_test("TestAudioReceiverBuffer")
+	use_test("TestDuplicateVoiceSuppressor")
 endif()
 
 # Shared tests
