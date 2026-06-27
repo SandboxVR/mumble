@@ -470,6 +470,9 @@ void Server::readParams() {
 		getConf("broadcastlistenervolumeadjustments", broadcastListenerVolumeAdjustments).toBool();
 	ssvrDuplicateVoiceSuppression =
 		getConf("ssvr_duplicate_voice_suppression", ssvrDuplicateVoiceSuppression).toBool();
+	log(QString::fromLatin1(
+			"ssvr_duplicate_voice_suppression enabled=%1 mode=metadata_heuristic fail_open=true")
+			.arg(ssvrDuplicateVoiceSuppression ? QLatin1String("true") : QLatin1String("false")));
 }
 
 void Server::setLiveConf(const QString &key, const QString &value) {
@@ -612,6 +615,9 @@ void Server::setLiveConf(const QString &key, const QString &value) {
 		if (!ssvrDuplicateVoiceSuppression) {
 			m_duplicateVoiceSuppressor.clear();
 		}
+		log(QString::fromLatin1(
+				"ssvr_duplicate_voice_suppression live_config enabled=%1 mode=metadata_heuristic fail_open=true")
+				.arg(ssvrDuplicateVoiceSuppression ? QLatin1String("true") : QLatin1String("false")));
 	}
 }
 
