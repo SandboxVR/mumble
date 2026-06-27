@@ -105,6 +105,7 @@ public:
 	unsigned int iPluginMessageBurst;
 
 	bool broadcastListenerVolumeAdjustments;
+	bool ssvrDuplicateVoiceSuppression;
 
 	QSslCertificate qscCert;
 	QSslKey qskKey;

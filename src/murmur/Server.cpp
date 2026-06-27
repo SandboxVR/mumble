@@ -43,6 +43,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <vector>
 
 #ifdef Q_OS_WIN
@@ -348,6 +349,7 @@ void Server::readParams() {
 	iPluginMessageLimit                = Meta::mp.iPluginMessageLimit;
 	iPluginMessageBurst                = Meta::mp.iPluginMessageBurst;
 	broadcastListenerVolumeAdjustments = Meta::mp.broadcastListenerVolumeAdjustments;
+	ssvrDuplicateVoiceSuppression      = Meta::mp.ssvrDuplicateVoiceSuppression;
 	m_suggestVersion                   = Meta::mp.m_suggestVersion;
 	qvSuggestPositional                = Meta::mp.qvSuggestPositional;
 	qvSuggestPushToTalk                = Meta::mp.qvSuggestPushToTalk;
@@ -466,6 +468,8 @@ void Server::readParams() {
 	}
 	broadcastListenerVolumeAdjustments =
 		getConf("broadcastlistenervolumeadjustments", broadcastListenerVolumeAdjustments).toBool();
+	ssvrDuplicateVoiceSuppression =
+		getConf("ssvr_duplicate_voice_suppression", ssvrDuplicateVoiceSuppression).toBool();
 }
 
 void Server::setLiveConf(const QString &key, const QString &value) {
@@ -602,6 +606,12 @@ void Server::setLiveConf(const QString &key, const QString &value) {
 	} else if (key == "broadcastlistenervolumeadjustments") {
 		broadcastListenerVolumeAdjustments =
 			(!v.isNull() ? QVariant(v).toBool() : Meta::mp.broadcastListenerVolumeAdjustments);
+	} else if (key == "ssvr_duplicate_voice_suppression") {
+		ssvrDuplicateVoiceSuppression =
+			(!v.isNull() ? QVariant(v).toBool() : Meta::mp.ssvrDuplicateVoiceSuppression);
+		if (!ssvrDuplicateVoiceSuppression) {
+			m_duplicateVoiceSuppressor.clear();
+		}
 	}
 }
 
@@ -1169,6 +1179,51 @@ void Server::processMsg(ServerUser *u, Mumble::Protocol::AudioData audioData, Au
 		buffer.forceAddReceiver(*u, Mumble::Protocol::AudioContext::NORMAL, audioData.containsPositionalData);
 	} else if (audioData.targetOrContext == Mumble::Protocol::ReservedTargetIDs::REGULAR_SPEECH) {
 		Channel *c = u->cChannel;
+		if (!c) {
+			return;
+		}
+
+		if (ssvrDuplicateVoiceSuppression) {
+			const std::int64_t nowMilliseconds =
+				std::chrono::duration_cast< std::chrono::milliseconds >(
+					std::chrono::steady_clock::now().time_since_epoch())
+					.count();
+
+			DuplicateVoiceSuppressor::PacketMetadata metadata;
+			metadata.sessionID             = u->uiSession;
+			metadata.channelID              = c->iId;
+			metadata.timestampMilliseconds  = nowMilliseconds;
+			metadata.codec                  = audioData.usedCodec;
+			metadata.payloadSize            = audioData.payload.size();
+			metadata.frameNumber            = audioData.frameNumber;
+			metadata.isPrioritySpeaker      = u->bPrioritySpeaker;
+			metadata.isWhisperOrDirect      = false;
+			metadata.isTerminator           = audioData.isLastFrame;
+
+			DuplicateVoiceSuppressor::Result suppressionResult =
+				m_duplicateVoiceSuppressor.shouldForwardVoicePacket(metadata);
+
+			if (suppressionResult.hasDetails) {
+				QStringList sessions;
+				for (std::uint32_t session : suppressionResult.details.candidateSessions) {
+					sessions << QString::number(session);
+				}
+
+				log(QString::fromLatin1(
+						"ssvr_duplicate_voice_suppression candidate_duplicate_group channel=%1 sessions=[%2] "
+						"kept_session=%3 suppressed_session=%4 kept_score=%5 suppressed_score=%6 reason=\"%7\"")
+						.arg(QString::number(suppressionResult.details.channelID), sessions.join(QLatin1String(",")),
+							 QString::number(suppressionResult.details.keptSession),
+							 QString::number(suppressionResult.details.suppressedSession),
+							 QString::number(suppressionResult.details.keptScore, 'f', 2),
+							 QString::number(suppressionResult.details.suppressedScore, 'f', 2),
+							 QString::fromStdString(suppressionResult.details.reason)));
+			}
+
+			if (suppressionResult.decision == DuplicateVoiceSuppressor::Decision::Suppress) {
+				return;
+			}
+		}
 
 		// Send audio to all users that are listening to the channel
 		foreach (unsigned int currentSession, m_channelListenerManager.getListenersForChannel(c->iId)) {

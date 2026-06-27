@@ -16,6 +16,7 @@
 #include "AudioReceiverBuffer.h"
 #include "Ban.h"
 #include "ChannelListenerManager.h"
+#include "DuplicateVoiceSuppressor.h"
 #include "HostAddress.h"
 #include "Mumble.pb.h"
 #include "MumbleProtocol.h"
@@ -147,6 +148,7 @@ public:
 	unsigned int iPluginMessageBurst;
 
 	bool broadcastListenerVolumeAdjustments;
+	bool ssvrDuplicateVoiceSuppression;
 
 	Version::full_t m_suggestVersion;
 
@@ -211,6 +213,7 @@ private:
 
 	AudioReceiverBuffer m_udpAudioReceivers;
 	AudioReceiverBuffer m_tcpAudioReceivers;
+	DuplicateVoiceSuppressor m_duplicateVoiceSuppressor;
 
 public slots:
 	void regSslError(const QList< QSslError > &);

@@ -23,6 +23,8 @@ set(MURMUR_SOURCES
 	"AudioReceiverBuffer.cpp"
 	"AudioReceiverBuffer.h"
 	"Cert.cpp"
+	"DuplicateVoiceSuppressor.cpp"
+	"DuplicateVoiceSuppressor.h"
 	"Messages.cpp"
 	"Meta.cpp"
 	"Meta.h"
