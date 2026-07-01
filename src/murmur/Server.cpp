@@ -350,6 +350,7 @@ void Server::readParams() {
 	iPluginMessageBurst                = Meta::mp.iPluginMessageBurst;
 	broadcastListenerVolumeAdjustments = Meta::mp.broadcastListenerVolumeAdjustments;
 	ssvrDuplicateVoiceSuppression      = Meta::mp.ssvrDuplicateVoiceSuppression;
+	ssvrDuplicateVoiceSuppressionAcoustic = Meta::mp.ssvrDuplicateVoiceSuppressionAcoustic;
 	m_suggestVersion                   = Meta::mp.m_suggestVersion;
 	qvSuggestPositional                = Meta::mp.qvSuggestPositional;
 	qvSuggestPushToTalk                = Meta::mp.qvSuggestPushToTalk;
@@ -470,9 +471,20 @@ void Server::readParams() {
 		getConf("broadcastlistenervolumeadjustments", broadcastListenerVolumeAdjustments).toBool();
 	ssvrDuplicateVoiceSuppression =
 		getConf("ssvr_duplicate_voice_suppression", ssvrDuplicateVoiceSuppression).toBool();
+	ssvrDuplicateVoiceSuppressionAcoustic =
+		getConf("ssvr_duplicate_voice_suppression_acoustic", ssvrDuplicateVoiceSuppressionAcoustic).toBool();
+	m_duplicateVoiceSuppressor.setAcousticOracle(&m_duplicateAudioCorrelator);
+	m_duplicateVoiceSuppressor.setAcousticConfirmationEnabled(ssvrDuplicateVoiceSuppression
+																&& ssvrDuplicateVoiceSuppressionAcoustic);
 	log(QString::fromLatin1(
 			"ssvr_duplicate_voice_suppression enabled=%1 mode=metadata_heuristic fail_open=true")
 			.arg(ssvrDuplicateVoiceSuppression ? QLatin1String("true") : QLatin1String("false")));
+	log(QString::fromLatin1("ssvr_duplicate_voice_suppression_acoustic enabled=%1 (effective=%2) "
+							 "mode=opus_cross_correlation")
+			.arg(ssvrDuplicateVoiceSuppressionAcoustic ? QLatin1String("true") : QLatin1String("false"))
+			.arg((ssvrDuplicateVoiceSuppression && ssvrDuplicateVoiceSuppressionAcoustic)
+					 ? QLatin1String("true")
+					 : QLatin1String("false")));
 }
 
 void Server::setLiveConf(const QString &key, const QString &value) {
@@ -612,12 +624,25 @@ void Server::setLiveConf(const QString &key, const QString &value) {
 	} else if (key == "ssvr_duplicate_voice_suppression") {
 		ssvrDuplicateVoiceSuppression =
 			(!v.isNull() ? QVariant(v).toBool() : Meta::mp.ssvrDuplicateVoiceSuppression);
+		m_duplicateVoiceSuppressor.setAcousticConfirmationEnabled(ssvrDuplicateVoiceSuppression
+																	&& ssvrDuplicateVoiceSuppressionAcoustic);
 		if (!ssvrDuplicateVoiceSuppression) {
 			m_duplicateVoiceSuppressor.clear();
 		}
 		log(QString::fromLatin1(
 				"ssvr_duplicate_voice_suppression live_config enabled=%1 mode=metadata_heuristic fail_open=true")
 				.arg(ssvrDuplicateVoiceSuppression ? QLatin1String("true") : QLatin1String("false")));
+	} else if (key == "ssvr_duplicate_voice_suppression_acoustic") {
+		ssvrDuplicateVoiceSuppressionAcoustic =
+			(!v.isNull() ? QVariant(v).toBool() : Meta::mp.ssvrDuplicateVoiceSuppressionAcoustic);
+		m_duplicateVoiceSuppressor.setAcousticConfirmationEnabled(ssvrDuplicateVoiceSuppression
+																	&& ssvrDuplicateVoiceSuppressionAcoustic);
+		log(QString::fromLatin1("ssvr_duplicate_voice_suppression_acoustic live_config enabled=%1 "
+								 "(effective=%2) mode=opus_cross_correlation")
+				.arg(ssvrDuplicateVoiceSuppressionAcoustic ? QLatin1String("true") : QLatin1String("false"))
+				.arg((ssvrDuplicateVoiceSuppression && ssvrDuplicateVoiceSuppressionAcoustic)
+						 ? QLatin1String("true")
+						 : QLatin1String("false")));
 	}
 }
 
@@ -1201,6 +1226,7 @@ void Server::processMsg(ServerUser *u, Mumble::Protocol::AudioData audioData, Au
 			metadata.timestampMilliseconds  = nowMilliseconds;
 			metadata.codec                  = audioData.usedCodec;
 			metadata.payloadSize            = audioData.payload.size();
+			metadata.payloadData            = audioData.payload.data();
 			metadata.frameNumber            = audioData.frameNumber;
 			metadata.isPrioritySpeaker      = u->bPrioritySpeaker;
 			metadata.isWhisperOrDirect      = false;
@@ -1734,6 +1760,8 @@ void Server::connectionClosed(QAbstractSocket::SocketError err, const QString &r
 
 		if (old)
 			old->removeUser(u);
+
+		m_duplicateAudioCorrelator.forgetSession(u->uiSession);
 	}
 
 	if (old && old->bTemporary && old->qlUsers.isEmpty())

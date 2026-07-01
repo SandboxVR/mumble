@@ -108,6 +108,8 @@ MetaParams::MetaParams() {
 
 	broadcastListenerVolumeAdjustments = false;
 	ssvrDuplicateVoiceSuppression      = false;
+	// Opt-in, and only meaningful when ssvrDuplicateVoiceSuppression above is also true.
+	ssvrDuplicateVoiceSuppressionAcoustic = false;
 
 	qsCiphers = MumbleSSL::defaultOpenSSLCipherString();
 
@@ -379,6 +381,8 @@ void MetaParams::read(QString fname) {
 
 	broadcastListenerVolumeAdjustments = typeCheckedFromSettings("broadcastlistenervolumeadjustments", false);
 	ssvrDuplicateVoiceSuppression      = typeCheckedFromSettings("ssvr_duplicate_voice_suppression", false);
+	ssvrDuplicateVoiceSuppressionAcoustic =
+		typeCheckedFromSettings("ssvr_duplicate_voice_suppression_acoustic", false);
 
 	bool bObfuscate = typeCheckedFromSettings("obfuscate", false);
 	if (bObfuscate) {
@@ -437,6 +441,8 @@ void MetaParams::read(QString fname) {
 	qmConfig.insert(QLatin1String("opusthreshold"), QString::number(iOpusThreshold));
 	qmConfig.insert(QLatin1String("ssvr_duplicate_voice_suppression"),
 					ssvrDuplicateVoiceSuppression ? QLatin1String("true") : QLatin1String("false"));
+	qmConfig.insert(QLatin1String("ssvr_duplicate_voice_suppression_acoustic"),
+					ssvrDuplicateVoiceSuppressionAcoustic ? QLatin1String("true") : QLatin1String("false"));
 	qmConfig.insert(QLatin1String("channelnestinglimit"), QString::number(iChannelNestingLimit));
 	qmConfig.insert(QLatin1String("channelcountlimit"), QString::number(iChannelCountLimit));
 	qmConfig.insert(QLatin1String("sslCiphers"), qsCiphers);

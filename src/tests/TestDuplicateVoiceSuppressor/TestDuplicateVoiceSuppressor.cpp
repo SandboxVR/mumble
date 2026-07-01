@@ -8,11 +8,36 @@
 #include <QObject>
 #include <QtTest>
 
+// Fake IAcousticOracle used to test DuplicateVoiceSuppressor's gating logic without
+// linking Opus. See docs/dev/DuplicateVoiceSuppressionPlan.md Phase 2.
+class FakeAcousticOracle : public IAcousticOracle {
+public:
+	bool shouldConfirm               = true;
+	int submitCount                  = 0;
+	int isLikelySameSourceCallCount = 0;
+
+	bool isLikelySameSource(std::uint32_t, std::uint32_t, std::int64_t) override {
+		++isLikelySameSourceCallCount;
+		return shouldConfirm;
+	}
+	void submitPacket(std::uint32_t, Mumble::Protocol::AudioCodec, const unsigned char *, std::size_t,
+					   std::int64_t) override {
+		++submitCount;
+	}
+	void forgetSession(std::uint32_t) override {}
+	double lastCorrelationScore() const override { return shouldConfirm ? 1.0 : 0.0; }
+};
+
 class TestDuplicateVoiceSuppressor : public QObject {
 	Q_OBJECT
 
 private:
 	using Decision = DuplicateVoiceSuppressor::Decision;
+
+	static const unsigned char *dummyPayload() {
+		static const unsigned char data[] = { 0 };
+		return data;
+	}
 
 	DuplicateVoiceSuppressor::PacketMetadata packet(std::uint32_t sessionID, unsigned int channelID,
 													std::int64_t timestampMilliseconds, std::uint64_t frameNumber,
@@ -24,6 +49,7 @@ private:
 		metadata.codec                  = Mumble::Protocol::AudioCodec::Opus;
 		metadata.payloadSize            = payloadSize;
 		metadata.frameNumber            = frameNumber;
+		metadata.payloadData            = dummyPayload();
 		return metadata;
 	}
 
@@ -111,6 +137,89 @@ private slots:
 			QCOMPARE(static_cast< int >(suppressor.shouldForwardVoicePacket(whisper).decision),
 					 static_cast< int >(Decision::NoDecision));
 		}
+	}
+
+	// Same sequence as test_weakerOverlappingStreamIsSuppressedAfterHysteresis, replayed
+	// with no oracle wired at all -- confirms acoustic confirmation being unused leaves
+	// Phase 1 behavior byte-for-byte unchanged.
+	void test_acousticConfirmationDisabledByDefaultMatchesPhase1() {
+		DuplicateVoiceSuppressor suppressor;
+
+		QCOMPARE(static_cast< int >(suppressor.shouldForwardVoicePacket(packet(1, 7, 0, 0, 100)).decision),
+				 static_cast< int >(Decision::NoDecision));
+		QCOMPARE(static_cast< int >(suppressor.shouldForwardVoicePacket(packet(2, 7, 10, 0, 35)).decision),
+				 static_cast< int >(Decision::NoDecision));
+		QCOMPARE(static_cast< int >(suppressor.shouldForwardVoicePacket(packet(1, 7, 20, 1, 102)).decision),
+				 static_cast< int >(Decision::NoDecision));
+		QCOMPARE(static_cast< int >(suppressor.shouldForwardVoicePacket(packet(2, 7, 30, 1, 34)).decision),
+				 static_cast< int >(Decision::NoDecision));
+		QCOMPARE(static_cast< int >(suppressor.shouldForwardVoicePacket(packet(1, 7, 40, 2, 101)).decision),
+				 static_cast< int >(Decision::NoDecision));
+
+		DuplicateVoiceSuppressor::Result result = suppressor.shouldForwardVoicePacket(packet(2, 7, 50, 2, 36));
+		QCOMPARE(static_cast< int >(result.decision), static_cast< int >(Decision::Suppress));
+	}
+
+	void test_acousticConfirmationVetoesSuppressionWhenOracleDisagrees() {
+		DuplicateVoiceSuppressor suppressor;
+		FakeAcousticOracle oracle;
+		oracle.shouldConfirm = false;
+		suppressor.setAcousticOracle(&oracle);
+		suppressor.setAcousticConfirmationEnabled(true);
+
+		suppressor.shouldForwardVoicePacket(packet(1, 7, 0, 0, 100));
+		suppressor.shouldForwardVoicePacket(packet(2, 7, 10, 0, 35));
+		suppressor.shouldForwardVoicePacket(packet(1, 7, 20, 1, 102));
+		suppressor.shouldForwardVoicePacket(packet(2, 7, 30, 1, 34));
+		suppressor.shouldForwardVoicePacket(packet(1, 7, 40, 2, 101));
+
+		DuplicateVoiceSuppressor::Result result = suppressor.shouldForwardVoicePacket(packet(2, 7, 50, 2, 36));
+		QCOMPARE(static_cast< int >(result.decision), static_cast< int >(Decision::NoDecision));
+		QVERIFY(oracle.isLikelySameSourceCallCount > 0);
+	}
+
+	void test_acousticConfirmationAllowsSuppressionWhenOracleAgrees() {
+		DuplicateVoiceSuppressor suppressor;
+		FakeAcousticOracle oracle;
+		oracle.shouldConfirm = true;
+		suppressor.setAcousticOracle(&oracle);
+		suppressor.setAcousticConfirmationEnabled(true);
+
+		suppressor.shouldForwardVoicePacket(packet(1, 7, 0, 0, 100));
+		suppressor.shouldForwardVoicePacket(packet(2, 7, 10, 0, 35));
+		suppressor.shouldForwardVoicePacket(packet(1, 7, 20, 1, 102));
+		suppressor.shouldForwardVoicePacket(packet(2, 7, 30, 1, 34));
+		suppressor.shouldForwardVoicePacket(packet(1, 7, 40, 2, 101));
+
+		DuplicateVoiceSuppressor::Result result = suppressor.shouldForwardVoicePacket(packet(2, 7, 50, 2, 36));
+		QCOMPARE(static_cast< int >(result.decision), static_cast< int >(Decision::Suppress));
+		QVERIFY(oracle.isLikelySameSourceCallCount > 0);
+	}
+
+	void test_acousticOracleOnlyConsultedOnCandidateOverlap() {
+		DuplicateVoiceSuppressor suppressor;
+		FakeAcousticOracle oracle;
+		suppressor.setAcousticOracle(&oracle);
+		suppressor.setAcousticConfirmationEnabled(true);
+
+		// Isolated, non-overlapping packets (300ms apart, well beyond OVERLAP_WINDOW_MS) --
+		// the oracle must not be touched at all for these.
+		suppressor.shouldForwardVoicePacket(packet(1, 7, 0, 0, 40));
+		suppressor.shouldForwardVoicePacket(packet(2, 7, 300, 0, 20));
+		QCOMPARE(oracle.submitCount, 0);
+		QCOMPARE(oracle.isLikelySameSourceCallCount, 0);
+
+		// Now feed an overlapping sequence that reaches the weak-frame suppression
+		// threshold -- only then should the oracle be consulted.
+		suppressor.shouldForwardVoicePacket(packet(1, 7, 1000, 1, 100));
+		suppressor.shouldForwardVoicePacket(packet(2, 7, 1010, 1, 35));
+		suppressor.shouldForwardVoicePacket(packet(1, 7, 1020, 2, 102));
+		suppressor.shouldForwardVoicePacket(packet(2, 7, 1030, 2, 34));
+		suppressor.shouldForwardVoicePacket(packet(1, 7, 1040, 3, 101));
+		suppressor.shouldForwardVoicePacket(packet(2, 7, 1050, 3, 36));
+
+		QVERIFY(oracle.submitCount > 0);
+		QCOMPARE(oracle.isLikelySameSourceCallCount, 1);
 	}
 };
 

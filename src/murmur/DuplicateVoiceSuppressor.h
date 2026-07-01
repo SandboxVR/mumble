@@ -6,6 +6,7 @@
 #ifndef MUMBLE_MURMUR_DUPLICATEVOICESUPPRESSOR_H_
 #define MUMBLE_MURMUR_DUPLICATEVOICESUPPRESSOR_H_
 
+#include "IAcousticOracle.h"
 #include "MumbleProtocol.h"
 
 #include <cstddef>
@@ -28,6 +29,10 @@ public:
 		bool isPrioritySpeaker             = false;
 		bool isWhisperOrDirect             = false;
 		bool isTerminator                  = false;
+		// Optional; only required when acoustic confirmation is enabled. May be nullptr
+		// (e.g. existing metadata-only tests) -- guarded by acoustic-path code, never
+		// dereferenced otherwise.
+		const unsigned char *payloadData = nullptr;
 	};
 
 	struct DecisionDetails {
@@ -48,6 +53,13 @@ public:
 
 	Result shouldForwardVoicePacket(const PacketMetadata &metadata);
 	void clear();
+
+	// Non-owning; the caller (Server) owns the real oracle and must outlive its use here.
+	// Pass nullptr to disable (default). See setAcousticConfirmationEnabled() -- acoustic
+	// confirmation is only consulted when both an oracle is set AND enabled is true, so
+	// Phase 1 behavior is unaffected unless both are explicitly turned on.
+	void setAcousticOracle(IAcousticOracle *oracle);
+	void setAcousticConfirmationEnabled(bool enabled);
 
 private:
 	struct Activity {
@@ -77,6 +89,9 @@ private:
 
 	std::unordered_map< unsigned int, std::unordered_map< std::uint32_t, Activity > > m_activityByChannel;
 	std::unordered_map< std::uint32_t, SessionState > m_sessionStates;
+
+	IAcousticOracle *m_acousticOracle          = nullptr;
+	bool m_acousticConfirmationEnabled = false;
 
 	void pruneChannel(unsigned int channelID, std::int64_t nowMilliseconds);
 	void updateActivity(const PacketMetadata &metadata, double score, unsigned int continuityFrames);

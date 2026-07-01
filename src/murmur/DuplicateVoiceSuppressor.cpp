@@ -20,6 +20,14 @@ void DuplicateVoiceSuppressor::clear() {
 	m_sessionStates.clear();
 }
 
+void DuplicateVoiceSuppressor::setAcousticOracle(IAcousticOracle *oracle) {
+	m_acousticOracle = oracle;
+}
+
+void DuplicateVoiceSuppressor::setAcousticConfirmationEnabled(bool enabled) {
+	m_acousticConfirmationEnabled = enabled;
+}
+
 DuplicateVoiceSuppressor::Result DuplicateVoiceSuppressor::shouldForwardVoicePacket(const PacketMetadata &metadata) {
 	Result result;
 
@@ -61,12 +69,24 @@ DuplicateVoiceSuppressor::Result DuplicateVoiceSuppressor::shouldForwardVoicePac
 	SessionState &sessionState = m_sessionStates[metadata.sessionID];
 
 	if (!overlappingActivities.empty() && !metadata.isPrioritySpeaker) {
+		if (m_acousticConfirmationEnabled && m_acousticOracle != nullptr && metadata.payloadData != nullptr) {
+			// Gated: only sessions currently part of an overlap candidate pair get decoded,
+			// never all traffic. Both sessions in an overlapping pair independently reach
+			// this branch on their own turn through this function, so this single call
+			// (for the "current" packet's session) is sufficient to keep both sides fed.
+			m_acousticOracle->submitPacket(metadata.sessionID, metadata.codec, metadata.payloadData,
+											metadata.payloadSize, metadata.timestampMilliseconds);
+		}
+
 		const Activity *bestActivity =
 			*std::max_element(overlappingActivities.begin(), overlappingActivities.end(),
 							  [](const Activity *lhs, const Activity *rhs) { return lhs->score < rhs->score; });
 
 		const bool sameCodec = bestActivity->codec == metadata.codec;
 		const bool stronger  = bestActivity->isPrioritySpeaker || (sameCodec && isClearlyStronger(bestActivity->score, currentScore));
+
+		bool acousticConfirmed = false;
+		bool acousticCheckRan  = false;
 
 		if (stronger) {
 			if (sessionState.candidatePrimarySession == bestActivity->sessionID) {
@@ -79,8 +99,23 @@ DuplicateVoiceSuppressor::Result DuplicateVoiceSuppressor::shouldForwardVoicePac
 			sessionState.releaseFrames = 0;
 
 			if (sessionState.consecutiveWeakFrames >= REQUIRED_WEAK_FRAMES) {
-				sessionState.suppressed = true;
-				result.decision         = Decision::Suppress;
+				// Acoustic confirmation is only *consulted* at the point Phase 1 is about to
+				// suppress, not every frame. When acoustic mode is off (or no oracle is
+				// wired), acousticConfirmed defaults to true, preserving Phase 1 behavior
+				// exactly. When it disagrees, we intentionally do not suppress and do not
+				// reset consecutiveWeakFrames, so a transient decode hiccup on one frame
+				// doesn't discard an otherwise-valid streak.
+				acousticConfirmed = true;
+				if (m_acousticConfirmationEnabled && m_acousticOracle != nullptr) {
+					acousticCheckRan  = true;
+					acousticConfirmed = m_acousticOracle->isLikelySameSource(
+						bestActivity->sessionID, metadata.sessionID, metadata.timestampMilliseconds);
+				}
+
+				if (acousticConfirmed) {
+					sessionState.suppressed = true;
+					result.decision         = Decision::Suppress;
+				}
 			}
 		} else if (sessionState.suppressed && sessionState.candidatePrimarySession != 0) {
 			sessionState.releaseFrames++;
@@ -115,6 +150,10 @@ DuplicateVoiceSuppressor::Result DuplicateVoiceSuppressor::shouldForwardVoicePac
 				   << " payload_size=" << metadata.payloadSize;
 			if (bestActivity->isPrioritySpeaker) {
 				reason << " kept_is_priority_speaker=true";
+			}
+			if (acousticCheckRan) {
+				reason << " acoustic_confirmed=" << (acousticConfirmed ? "true" : "false")
+					   << " correlation_score=" << m_acousticOracle->lastCorrelationScore();
 			}
 			result.details.reason = reason.str();
 		}

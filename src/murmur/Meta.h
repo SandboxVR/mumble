@@ -106,6 +106,7 @@ public:
 
 	bool broadcastListenerVolumeAdjustments;
 	bool ssvrDuplicateVoiceSuppression;
+	bool ssvrDuplicateVoiceSuppressionAcoustic;
 
 	QSslCertificate qscCert;
 	QSslKey qskKey;

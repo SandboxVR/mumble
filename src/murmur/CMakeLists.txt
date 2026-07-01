@@ -17,14 +17,18 @@ include(qt-utils)
 option(ice "Build support for Ice RPC." ON)
 
 find_pkg(Qt5 COMPONENTS Sql REQUIRED)
+find_pkg("opus;Opus" REQUIRED)
 
 set(MURMUR_SOURCES
 	"main.cpp"
 	"AudioReceiverBuffer.cpp"
 	"AudioReceiverBuffer.h"
 	"Cert.cpp"
+	"DuplicateAudioCorrelator.cpp"
+	"DuplicateAudioCorrelator.h"
 	"DuplicateVoiceSuppressor.cpp"
 	"DuplicateVoiceSuppressor.h"
+	"IAcousticOracle.h"
 	"Messages.cpp"
 	"Meta.cpp"
 	"Meta.h"
@@ -80,7 +84,15 @@ target_include_directories(mumble-server PRIVATE
 	${SHARED_SOURCE_DIR}
 )
 
-target_link_libraries(mumble-server PRIVATE shared Qt5::Sql)
+target_include_directories(mumble-server PRIVATE ${opus_INCLUDE_DIRS})
+target_link_libraries(mumble-server PRIVATE shared Qt5::Sql ${opus_LIBRARIES})
+if(TARGET opus)
+	target_link_libraries(mumble-server PRIVATE opus)
+elseif(TARGET Opus)
+	target_link_libraries(mumble-server PRIVATE Opus)
+elseif(TARGET Opus::opus)
+	target_link_libraries(mumble-server PRIVATE Opus::opus)
+endif()
 
 if(static)
 	# MariaDB and MySQL

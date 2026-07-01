@@ -16,6 +16,7 @@
 #include "AudioReceiverBuffer.h"
 #include "Ban.h"
 #include "ChannelListenerManager.h"
+#include "DuplicateAudioCorrelator.h"
 #include "DuplicateVoiceSuppressor.h"
 #include "HostAddress.h"
 #include "Mumble.pb.h"
@@ -149,6 +150,7 @@ public:
 
 	bool broadcastListenerVolumeAdjustments;
 	bool ssvrDuplicateVoiceSuppression;
+	bool ssvrDuplicateVoiceSuppressionAcoustic;
 
 	Version::full_t m_suggestVersion;
 
@@ -214,6 +216,7 @@ private:
 	AudioReceiverBuffer m_udpAudioReceivers;
 	AudioReceiverBuffer m_tcpAudioReceivers;
 	DuplicateVoiceSuppressor m_duplicateVoiceSuppressor;
+	DuplicateAudioCorrelator m_duplicateAudioCorrelator;
 
 public slots:
 	void regSslError(const QList< QSslError > &);
