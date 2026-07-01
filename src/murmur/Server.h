@@ -375,6 +375,15 @@ public:
 	void log(const QString &) const;
 	void log(ServerUser *u, const QString &) const;
 
+	// Thread-safe subset of log(): writes only to the qWarning-routed log file/console, and
+	// deliberately skips dblog() (the per-server DB log table). dblog() uses a single
+	// QSqlDatabase connection created on the main thread; Qt SQL connections are not safe to
+	// use from any other thread, and doing so triggers a fatal "Driver not loaded" crash
+	// (ServerDB::prepare() calls qFatal() by default on query failure). Use this instead of
+	// log() for any call site reachable from Server::run() (the dedicated UDP voice thread)
+	// or Server::message(), such as processMsg().
+	void logRealtime(const QString &) const;
+
 	void removeChannel(unsigned int id);
 	void removeChannel(Channel *c, Channel *dest = nullptr);
 	void userEnterChannel(User *u, Channel *c, MumbleProto::UserState &mpus);

@@ -176,6 +176,14 @@ private slots:
 		DuplicateVoiceSuppressor::Result result = suppressor.shouldForwardVoicePacket(packet(2, 7, 50, 2, 36));
 		QCOMPARE(static_cast< int >(result.decision), static_cast< int >(Decision::NoDecision));
 		QVERIFY(oracle.isLikelySameSourceCallCount > 0);
+
+		// Gate 2 vetoing gate 1 must still be reported (for real-time logging) even though
+		// the packet itself is not suppressed.
+		QVERIFY(result.hasDetails);
+		QVERIFY(result.details.metadataGateTriggered);
+		QVERIFY(result.details.acousticGateRan);
+		QVERIFY(!result.details.acousticGateConfirmed);
+		QCOMPARE(result.details.suppressedSession, static_cast< std::uint32_t >(2));
 	}
 
 	void test_acousticConfirmationAllowsSuppressionWhenOracleAgrees() {

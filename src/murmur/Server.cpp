@@ -1235,21 +1235,55 @@ void Server::processMsg(ServerUser *u, Mumble::Protocol::AudioData audioData, Au
 			DuplicateVoiceSuppressor::Result suppressionResult =
 				m_duplicateVoiceSuppressor.shouldForwardVoicePacket(metadata);
 
+			if (suppressionResult.overlapDetected) {
+				QStringList overlapSessions;
+				for (std::uint32_t session : suppressionResult.overlappingSessions) {
+					overlapSessions << QString::number(session);
+				}
+				// logRealtime(), not log(): this can run on the dedicated UDP voice thread
+				// (Server::run()), where log()'s dblog() write would crash (Qt SQL
+				// connections are not safe to use outside the thread that created them).
+				logRealtime(QString::fromLatin1(
+						"ssvr_duplicate_voice_suppression OVERLAP channel=%1 sessions=[%2] (raw timing overlap; "
+						"gate1/gate2 decision, if any, logged separately)")
+						.arg(QString::number(suppressionResult.overlapChannelID), overlapSessions.join(QLatin1String(","))));
+			}
+
 			if (suppressionResult.hasDetails) {
 				QStringList sessions;
 				for (std::uint32_t session : suppressionResult.details.candidateSessions) {
 					sessions << QString::number(session);
 				}
 
-				log(QString::fromLatin1(
-						"ssvr_duplicate_voice_suppression candidate_duplicate_group channel=%1 sessions=[%2] "
-						"kept_session=%3 suppressed_session=%4 kept_score=%5 suppressed_score=%6 reason=\"%7\"")
-						.arg(QString::number(suppressionResult.details.channelID), sessions.join(QLatin1String(",")),
+				// Real-time visibility into both suppression gates: gate 1
+				// (ssvr_duplicate_voice_suppression, the metadata heuristic) either just
+				// triggered this frame or is continuing a hysteresis release from an earlier
+				// trigger; gate 2 (ssvr_duplicate_voice_suppression_acoustic) either wasn't
+				// consulted (disabled, or gate 1 didn't reach a decision point), confirmed
+				// gate 1's candidate, or vetoed it (audio is NOT muted in that case).
+				const bool muted      = suppressionResult.decision == DuplicateVoiceSuppressor::Decision::Suppress;
+				const QString action  = muted ? QLatin1String("MUTE") : QLatin1String("VETO");
+				const QString gate1State = suppressionResult.details.metadataGateTriggered
+												? QLatin1String("triggered")
+												: QLatin1String("releasing");
+				QString gate2State;
+				if (!suppressionResult.details.acousticGateRan) {
+					gate2State = QLatin1String("not_consulted");
+				} else {
+					gate2State = QString::fromLatin1("%1(score=%2)")
+									 .arg(suppressionResult.details.acousticGateConfirmed ? QLatin1String("confirmed")
+																						   : QLatin1String("vetoed"))
+									 .arg(suppressionResult.details.correlationScore, 0, 'f', 2);
+				}
+
+				// logRealtime(), not log() -- see comment on the OVERLAP log above.
+				logRealtime(QString::fromLatin1(
+						"ssvr_duplicate_voice_suppression %1 stream=session:%2 kept=session:%3 channel=%4 "
+						"sessions=[%5] gate1(metadata)=%6 gate2(acoustic)=%7 reason=\"%8\"")
+						.arg(action, QString::number(suppressionResult.details.suppressedSession),
 							 QString::number(suppressionResult.details.keptSession),
-							 QString::number(suppressionResult.details.suppressedSession),
-							 QString::number(suppressionResult.details.keptScore, 'f', 2),
-							 QString::number(suppressionResult.details.suppressedScore, 'f', 2),
-							 QString::fromStdString(suppressionResult.details.reason)));
+							 QString::number(suppressionResult.details.channelID), sessions.join(QLatin1String(",")),
+							 gate1State, gate2State, QString::fromStdString(suppressionResult.details.reason)));
 			}
 
 			if (suppressionResult.decision == DuplicateVoiceSuppressor::Decision::Suppress) {
@@ -1442,6 +1476,10 @@ void Server::log(ServerUser *u, const QString &str) const {
 
 void Server::log(const QString &msg) const {
 	dblog(msg);
+	qWarning("%d => %s", iServerNum, msg.toUtf8().constData());
+}
+
+void Server::logRealtime(const QString &msg) const {
 	qWarning("%d => %s", iServerNum, msg.toUtf8().constData());
 }
 

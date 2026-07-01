@@ -66,6 +66,19 @@ DuplicateVoiceSuppressor::Result DuplicateVoiceSuppressor::shouldForwardVoicePac
 		}
 	}
 
+	if (!overlappingActivities.empty()) {
+		result.overlapDetected  = true;
+		result.overlapChannelID = metadata.channelID;
+		result.overlappingSessions.push_back(metadata.sessionID);
+		for (const Activity *activity : overlappingActivities) {
+			result.overlappingSessions.push_back(activity->sessionID);
+		}
+		std::sort(result.overlappingSessions.begin(), result.overlappingSessions.end());
+		result.overlappingSessions.erase(
+			std::unique(result.overlappingSessions.begin(), result.overlappingSessions.end()),
+			result.overlappingSessions.end());
+	}
+
 	SessionState &sessionState = m_sessionStates[metadata.sessionID];
 
 	if (!overlappingActivities.empty() && !metadata.isPrioritySpeaker) {
@@ -85,8 +98,9 @@ DuplicateVoiceSuppressor::Result DuplicateVoiceSuppressor::shouldForwardVoicePac
 		const bool sameCodec = bestActivity->codec == metadata.codec;
 		const bool stronger  = bestActivity->isPrioritySpeaker || (sameCodec && isClearlyStronger(bestActivity->score, currentScore));
 
-		bool acousticConfirmed = false;
-		bool acousticCheckRan  = false;
+		bool acousticConfirmed     = false;
+		bool acousticCheckRan      = false;
+		bool metadataGateTriggered = false;
 
 		if (stronger) {
 			if (sessionState.candidatePrimarySession == bestActivity->sessionID) {
@@ -99,13 +113,17 @@ DuplicateVoiceSuppressor::Result DuplicateVoiceSuppressor::shouldForwardVoicePac
 			sessionState.releaseFrames = 0;
 
 			if (sessionState.consecutiveWeakFrames >= REQUIRED_WEAK_FRAMES) {
-				// Acoustic confirmation is only *consulted* at the point Phase 1 is about to
-				// suppress, not every frame. When acoustic mode is off (or no oracle is
-				// wired), acousticConfirmed defaults to true, preserving Phase 1 behavior
-				// exactly. When it disagrees, we intentionally do not suppress and do not
+				// Gate 1 (ssvr_duplicate_voice_suppression): the metadata heuristic has
+				// flagged metadata.sessionID as a candidate duplicate of bestActivity this
+				// frame. Acoustic confirmation (gate 2) is only *consulted* at this exact
+				// point, not every frame. When acoustic mode is off (or no oracle is wired),
+				// acousticConfirmed defaults to true, preserving Phase 1 behavior exactly.
+				// When gate 2 disagrees (vetoes), we intentionally do not suppress and do not
 				// reset consecutiveWeakFrames, so a transient decode hiccup on one frame
-				// doesn't discard an otherwise-valid streak.
-				acousticConfirmed = true;
+				// doesn't discard an otherwise-valid streak -- but we still report the veto
+				// below so it's visible in real time.
+				metadataGateTriggered = true;
+				acousticConfirmed     = true;
 				if (m_acousticConfirmationEnabled && m_acousticOracle != nullptr) {
 					acousticCheckRan  = true;
 					acousticConfirmed = m_acousticOracle->isLikelySameSource(
@@ -128,7 +146,10 @@ DuplicateVoiceSuppressor::Result DuplicateVoiceSuppressor::shouldForwardVoicePac
 			sessionState = SessionState();
 		}
 
-		if (result.decision == Decision::Suppress) {
+		// Report whenever gate 1 actively muted/continued-muting a stream (Suppress) OR gate
+		// 1 wanted to mute this frame but gate 2 vetoed it (metadataGateTriggered without
+		// Suppress) -- both are real-time-interesting events for operators watching the log.
+		if (result.decision == Decision::Suppress || metadataGateTriggered) {
 			result.hasDetails                 = true;
 			result.details.channelID          = metadata.channelID;
 			result.details.keptSession        = bestActivity->sessionID;
@@ -144,16 +165,21 @@ DuplicateVoiceSuppressor::Result DuplicateVoiceSuppressor::shouldForwardVoicePac
 				std::unique(result.details.candidateSessions.begin(), result.details.candidateSessions.end()),
 				result.details.candidateSessions.end());
 
+			result.details.metadataGateTriggered = metadataGateTriggered;
+			result.details.acousticGateRan       = acousticCheckRan;
+			result.details.acousticGateConfirmed = acousticConfirmed;
+			result.details.correlationScore = acousticCheckRan ? m_acousticOracle->lastCorrelationScore() : -1.0;
+
+			// Gate 1/gate 2 outcome and correlation score are exposed as structured fields
+			// above (metadataGateTriggered/acousticGateRan/acousticGateConfirmed/
+			// correlationScore) for callers to log clearly; keep this string to the
+			// heuristic-specific diagnostic detail that isn't otherwise exposed.
 			std::ostringstream reason;
 			reason << "overlap_window_ms=" << OVERLAP_WINDOW_MS << " codec=" << codecName(metadata.codec)
 				   << " consecutive_weaker_frames=" << sessionState.consecutiveWeakFrames
 				   << " payload_size=" << metadata.payloadSize;
 			if (bestActivity->isPrioritySpeaker) {
 				reason << " kept_is_priority_speaker=true";
-			}
-			if (acousticCheckRan) {
-				reason << " acoustic_confirmed=" << (acousticConfirmed ? "true" : "false")
-					   << " correlation_score=" << m_acousticOracle->lastCorrelationScore();
 			}
 			result.details.reason = reason.str();
 		}

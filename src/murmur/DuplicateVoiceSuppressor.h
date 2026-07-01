@@ -42,6 +42,15 @@ public:
 		std::uint32_t suppressedSession = 0;
 		double keptScore                = 0.0;
 		double suppressedScore          = 0.0;
+		// Gate 1 (ssvr_duplicate_voice_suppression): true whenever the metadata heuristic
+		// flagged suppressedSession as a candidate duplicate of keptSession this frame.
+		bool metadataGateTriggered = false;
+		// Gate 2 (ssvr_duplicate_voice_suppression_acoustic): whether it was consulted this
+		// frame, and if so, whether it confirmed (vs. vetoed) gate 1's candidate.
+		bool acousticGateRan       = false;
+		bool acousticGateConfirmed = false;
+		// Meaningful only when acousticGateRan is true; -1.0 otherwise.
+		double correlationScore = -1.0;
 		std::string reason;
 	};
 
@@ -49,6 +58,15 @@ public:
 		Decision decision = Decision::NoDecision;
 		DecisionDetails details;
 		bool hasDetails = false;
+		// True whenever this packet's session overlaps in time (within OVERLAP_WINDOW_MS,
+		// same channel) with at least one other session's recent packet -- regardless of
+		// whether gate 1 (metadata heuristic) or gate 2 (acoustic) ever reach a mute/veto
+		// decision. Fires far earlier and more cheaply than hasDetails; useful to confirm
+		// concurrent audio is actually reaching the server from two sessions at all, before
+		// diagnosing why a mute/veto decision isn't (or is) being made.
+		bool overlapDetected = false;
+		unsigned int overlapChannelID = 0;
+		std::vector< std::uint32_t > overlappingSessions;
 	};
 
 	Result shouldForwardVoicePacket(const PacketMetadata &metadata);
@@ -84,8 +102,18 @@ private:
 	static constexpr std::int64_t OVERLAP_WINDOW_MS = 120;
 	static constexpr unsigned int REQUIRED_WEAK_FRAMES = 3;
 	static constexpr unsigned int REQUIRED_RELEASE_FRAMES = 2;
-	static constexpr double MIN_STRONGER_RATIO = 1.25;
-	static constexpr double MIN_STRONGER_SCORE_DELTA = 8.0;
+	// Gate 1 only needs to flag a *candidate* duplicate pair -- when acoustic confirmation
+	// (gate 2) is enabled, it makes the real same-source-or-not call. Real duplicate mic
+	// pickup (two mics close together capturing the same voice) tends to produce very
+	// SIMILAR payload sizes between the two streams, since both captures are near-identical
+	// quality -- the original 1.25x/8-byte thresholds below were tuned as if "stronger"
+	// meant "clearly the real speaker" on their own, which made gate 1 too strict to ever
+	// flag the closest, cleanest duplicate-mic cases (field-tested: two headsets ~15cm
+	// apart producing zero candidates at the old thresholds). Loosened so near-tied streams
+	// still produce a candidate; gate 2 is what actually protects against false positives
+	// when it's enabled.
+	static constexpr double MIN_STRONGER_RATIO = 1.05;
+	static constexpr double MIN_STRONGER_SCORE_DELTA = 2.0;
 
 	std::unordered_map< unsigned int, std::unordered_map< std::uint32_t, Activity > > m_activityByChannel;
 	std::unordered_map< std::uint32_t, SessionState > m_sessionStates;
