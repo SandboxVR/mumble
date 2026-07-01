@@ -22,13 +22,13 @@ $mumble_deps = "qt5-base[mysqlplugin]",
                "protobuf",
                "zlib", 
                "zeroc-ice-mumble"
+               
 
 $ErrorActionPreference = 'Stop'
 
 function vcpkg_install {
 	Param(
 		[string[]] $packages,
-
 		[string] $targetTriplet,
 		[switch] $cleanAfterBuild = $false
 	)
@@ -40,7 +40,7 @@ function vcpkg_install {
 	}
 	
 	if (-not $?) {
-		Write-Error("Failed at installing package $package ($targetTriplet)")
+		Write-Error("Failed at installing package $($packages -join ', ') ($targetTriplet)")
 	}
 }
 
@@ -80,7 +80,7 @@ try {
 
 		Write-Host "Beginning package install..."
 
-		vcpkg_install -package $mumble_deps -targetTriplet $triplet -cleanAfterBuild
+		vcpkg_install -packages $mumble_deps -targetTriplet $triplet
 	}
 } catch {
 	# rethrow
