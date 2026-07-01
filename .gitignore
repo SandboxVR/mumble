@@ -47,6 +47,13 @@ doxygen/
 .directory
 build/
 compile_commands.json
+# Untracked dependency source trees fetched under 3rdparty/ that are not
+# registered as git submodules (see .gitmodules for the actual submodules).
+/3rdparty/CLI11/
+/3rdparty/rnnoise-src/
+/3rdparty/soci/
+/3rdparty/spdlog/
+/3rdparty/utfcpp/
 .devcontainer/*
 __pycache__/
 CMakeSettings.json
