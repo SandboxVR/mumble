@@ -112,7 +112,27 @@ private slots:
 
 		std::int64_t now = std::max(tsA, tsB);
 		QVERIFY(correlator.isLikelySameSource(1, 2, now));
-		QVERIFY(correlator.lastCorrelationScore() >= DuplicateAudioCorrelator::CORRELATION_THRESHOLD);
+		QVERIFY(correlator.lastCorrelationScore() >= DuplicateAudioCorrelator::DEFAULT_CORRELATION_THRESHOLD);
+	}
+
+	void test_configurableCorrelationThresholdCanVetoMatch() {
+		DuplicateAudioCorrelator correlator;
+		DuplicateAudioCorrelator::Config config;
+		config.correlationThreshold = 2.0;
+		config.verdictCacheMilliseconds = 0;
+		correlator.setConfig(config);
+
+		const std::size_t totalSamples = 19200;
+		std::vector< float > signal = generateSpeechShapedNoise(totalSamples, 9);
+
+		std::int64_t tsA = 0, tsB = 0;
+		feedFrames(correlator, 1, signal, 0, tsA);
+		feedFrames(correlator, 2, signal, 0, tsB);
+
+		std::int64_t now = std::max(tsA, tsB);
+		QVERIFY(!correlator.isLikelySameSource(1, 2, now));
+		QVERIFY(correlator.lastCorrelationScore() < config.correlationThreshold);
+		QCOMPARE(correlator.config().verdictCacheMilliseconds, static_cast< std::int64_t >(0));
 	}
 
 	void test_differentSpeakersAreNotConfirmed() {
@@ -129,7 +149,7 @@ private slots:
 
 		std::int64_t now = std::max(tsA, tsB);
 		QVERIFY(!correlator.isLikelySameSource(1, 2, now));
-		QVERIFY(correlator.lastCorrelationScore() < DuplicateAudioCorrelator::CORRELATION_THRESHOLD);
+		QVERIFY(correlator.lastCorrelationScore() < DuplicateAudioCorrelator::DEFAULT_CORRELATION_THRESHOLD);
 	}
 
 	void test_unequalHistoryLengthsAreEndAligned() {
@@ -146,7 +166,7 @@ private slots:
 
 		std::int64_t now = std::max(tsA, tsB);
 		QVERIFY(correlator.isLikelySameSource(1, 2, now));
-		QVERIFY(correlator.lastCorrelationScore() >= DuplicateAudioCorrelator::CORRELATION_THRESHOLD);
+		QVERIFY(correlator.lastCorrelationScore() >= DuplicateAudioCorrelator::DEFAULT_CORRELATION_THRESHOLD);
 	}
 
 	void test_arrivalTimeSkewBeyondOldWaveformLagIsConfirmed() {
@@ -164,7 +184,7 @@ private slots:
 
 		std::int64_t now = std::max(tsA, tsB);
 		QVERIFY(correlator.isLikelySameSource(1, 2, now));
-		QVERIFY(correlator.lastCorrelationScore() >= DuplicateAudioCorrelator::CORRELATION_THRESHOLD);
+		QVERIFY(correlator.lastCorrelationScore() >= DuplicateAudioCorrelator::DEFAULT_CORRELATION_THRESHOLD);
 	}
 
 	void test_staticGainAndTimeVaryingGateStillConfirm() {
@@ -183,7 +203,7 @@ private slots:
 
 		std::int64_t now = std::max(tsA, tsB);
 		QVERIFY(correlator.isLikelySameSource(1, 2, now));
-		QVERIFY(correlator.lastCorrelationScore() >= DuplicateAudioCorrelator::CORRELATION_THRESHOLD);
+		QVERIFY(correlator.lastCorrelationScore() >= DuplicateAudioCorrelator::DEFAULT_CORRELATION_THRESHOLD);
 	}
 
 	void test_differentFrameSizesStillConfirm() {
@@ -198,7 +218,7 @@ private slots:
 
 		std::int64_t now = std::max(tsA, tsB);
 		QVERIFY(correlator.isLikelySameSource(1, 2, now));
-		QVERIFY(correlator.lastCorrelationScore() >= DuplicateAudioCorrelator::CORRELATION_THRESHOLD);
+		QVERIFY(correlator.lastCorrelationScore() >= DuplicateAudioCorrelator::DEFAULT_CORRELATION_THRESHOLD);
 	}
 
 	void test_notEnoughDataFailsOpen() {

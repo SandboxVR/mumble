@@ -93,6 +93,58 @@ private slots:
 		QCOMPARE(result.details.suppressedSession, static_cast< std::uint32_t >(2));
 	}
 
+	void test_configurableWeakFrameThresholdSuppressesEarlier() {
+		DuplicateVoiceSuppressor suppressor;
+		DuplicateVoiceSuppressor::Config config;
+		config.requiredWeakFrames = 1;
+		suppressor.setConfig(config);
+
+		QCOMPARE(static_cast< int >(suppressor.shouldForwardVoicePacket(packet(1, 7, 0, 0, 100)).decision),
+				 static_cast< int >(Decision::NoDecision));
+
+		DuplicateVoiceSuppressor::Result result = suppressor.shouldForwardVoicePacket(packet(2, 7, 10, 0, 35));
+		QCOMPARE(static_cast< int >(result.decision), static_cast< int >(Decision::Suppress));
+		QVERIFY(result.hasDetails);
+	}
+
+	void test_configurableOverlapWindowPreventsCandidate() {
+		DuplicateVoiceSuppressor suppressor;
+		DuplicateVoiceSuppressor::Config config;
+		config.overlapWindowMilliseconds = 5;
+		suppressor.setConfig(config);
+
+		QCOMPARE(static_cast< int >(suppressor.shouldForwardVoicePacket(packet(1, 7, 0, 0, 100)).decision),
+				 static_cast< int >(Decision::NoDecision));
+
+		DuplicateVoiceSuppressor::Result result = suppressor.shouldForwardVoicePacket(packet(2, 7, 10, 0, 35));
+		QCOMPARE(static_cast< int >(result.decision), static_cast< int >(Decision::NoDecision));
+		QVERIFY(!result.hasDetails);
+		QVERIFY(!result.overlapDetected);
+	}
+
+	void test_releaseCompleteReportsUnmuteDetails() {
+		DuplicateVoiceSuppressor suppressor;
+
+		suppressor.shouldForwardVoicePacket(packet(1, 7, 0, 0, 100));
+		suppressor.shouldForwardVoicePacket(packet(2, 7, 10, 0, 35));
+		suppressor.shouldForwardVoicePacket(packet(1, 7, 20, 1, 102));
+		suppressor.shouldForwardVoicePacket(packet(2, 7, 30, 1, 34));
+		suppressor.shouldForwardVoicePacket(packet(1, 7, 40, 2, 101));
+		QCOMPARE(static_cast< int >(suppressor.shouldForwardVoicePacket(packet(2, 7, 50, 2, 36)).decision),
+				 static_cast< int >(Decision::Suppress));
+
+		QCOMPARE(static_cast< int >(suppressor.shouldForwardVoicePacket(packet(2, 7, 60, 3, 200)).decision),
+				 static_cast< int >(Decision::Suppress));
+		QCOMPARE(static_cast< int >(suppressor.shouldForwardVoicePacket(packet(2, 7, 70, 4, 200)).decision),
+				 static_cast< int >(Decision::Suppress));
+		DuplicateVoiceSuppressor::Result released = suppressor.shouldForwardVoicePacket(packet(2, 7, 80, 5, 200));
+		QCOMPARE(static_cast< int >(released.decision), static_cast< int >(Decision::Forward));
+		QVERIFY(released.hasDetails);
+		QVERIFY(released.details.releaseComplete);
+		QCOMPARE(released.details.keptSession, static_cast< std::uint32_t >(1));
+		QCOMPARE(released.details.suppressedSession, static_cast< std::uint32_t >(2));
+	}
+
 	void test_differentChannelsDoNotSuppress() {
 		DuplicateVoiceSuppressor suppressor;
 
