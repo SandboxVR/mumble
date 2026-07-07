@@ -11,6 +11,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -71,6 +72,7 @@ public:
 
 	Result shouldForwardVoicePacket(const PacketMetadata &metadata);
 	void clear();
+	void forgetSession(std::uint32_t sessionID);
 
 	// Non-owning; the caller (Server) owns the real oracle and must outlive its use here.
 	// Pass nullptr to disable (default). See setAcousticConfirmationEnabled() -- acoustic
@@ -118,6 +120,7 @@ private:
 	std::unordered_map< unsigned int, std::unordered_map< std::uint32_t, Activity > > m_activityByChannel;
 	std::unordered_map< std::uint32_t, SessionState > m_sessionStates;
 
+	std::mutex m_mutex;
 	IAcousticOracle *m_acousticOracle          = nullptr;
 	bool m_acousticConfirmationEnabled = false;
 

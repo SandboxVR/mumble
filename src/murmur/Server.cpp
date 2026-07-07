@@ -1240,13 +1240,30 @@ void Server::processMsg(ServerUser *u, Mumble::Protocol::AudioData audioData, Au
 				for (std::uint32_t session : suppressionResult.overlappingSessions) {
 					overlapSessions << QString::number(session);
 				}
-				// logRealtime(), not log(): this can run on the dedicated UDP voice thread
-				// (Server::run()), where log()'s dblog() write would crash (Qt SQL
-				// connections are not safe to use outside the thread that created them).
-				logRealtime(QString::fromLatin1(
-						"ssvr_duplicate_voice_suppression OVERLAP channel=%1 sessions=[%2] (raw timing overlap; "
-						"gate1/gate2 decision, if any, logged separately)")
-						.arg(QString::number(suppressionResult.overlapChannelID), overlapSessions.join(QLatin1String(","))));
+				const QString joinedOverlapSessions = overlapSessions.join(QLatin1String(","));
+				bool shouldLogOverlap               = false;
+				{
+					QMutexLocker lock(&m_duplicateVoiceSuppressionLogMutex);
+					const QString logKey = QString::fromLatin1("overlap:%1:%2")
+											   .arg(QString::number(suppressionResult.overlapChannelID),
+													joinedOverlapSessions);
+					DuplicateVoiceSuppressionLogState &logState = m_duplicateVoiceSuppressionLogStates[logKey];
+					if (logState.lastOverlapLogMilliseconds < 0
+						|| nowMilliseconds - logState.lastOverlapLogMilliseconds >= 1000) {
+						logState.lastOverlapLogMilliseconds = nowMilliseconds;
+						shouldLogOverlap                    = true;
+					}
+				}
+
+				if (shouldLogOverlap) {
+					// logRealtime(), not log(): this can run on the dedicated UDP voice thread
+					// (Server::run()), where log()'s dblog() write would crash (Qt SQL
+					// connections are not safe to use outside the thread that created them).
+					logRealtime(QString::fromLatin1(
+							"ssvr_duplicate_voice_suppression OVERLAP channel=%1 sessions=[%2] (raw timing overlap; "
+							"gate1/gate2 decision, if any, logged separately)")
+							.arg(QString::number(suppressionResult.overlapChannelID), joinedOverlapSessions));
+				}
 			}
 
 			if (suppressionResult.hasDetails) {
@@ -1276,14 +1293,40 @@ void Server::processMsg(ServerUser *u, Mumble::Protocol::AudioData audioData, Au
 									 .arg(suppressionResult.details.correlationScore, 0, 'f', 2);
 				}
 
-				// logRealtime(), not log() -- see comment on the OVERLAP log above.
-				logRealtime(QString::fromLatin1(
-						"ssvr_duplicate_voice_suppression %1 stream=session:%2 kept=session:%3 channel=%4 "
-						"sessions=[%5] gate1(metadata)=%6 gate2(acoustic)=%7 reason=\"%8\"")
-						.arg(action, QString::number(suppressionResult.details.suppressedSession),
-							 QString::number(suppressionResult.details.keptSession),
-							 QString::number(suppressionResult.details.channelID), sessions.join(QLatin1String(",")),
-							 gate1State, gate2State, QString::fromStdString(suppressionResult.details.reason)));
+				bool shouldLogDecision = false;
+				{
+					QMutexLocker lock(&m_duplicateVoiceSuppressionLogMutex);
+					const QString logKey = QString::fromLatin1("decision:%1:%2:%3")
+											   .arg(QString::number(suppressionResult.details.channelID),
+													QString::number(suppressionResult.details.suppressedSession),
+													QString::number(suppressionResult.details.keptSession));
+					const QString decisionState = QString::fromLatin1("%1:%2:%3")
+												  .arg(action, gate1State,
+													   suppressionResult.details.acousticGateRan
+														   ? (suppressionResult.details.acousticGateConfirmed
+																  ? QLatin1String("confirmed")
+																  : QLatin1String("vetoed"))
+														   : QLatin1String("not_consulted"));
+					DuplicateVoiceSuppressionLogState &logState = m_duplicateVoiceSuppressionLogStates[logKey];
+					if (logState.lastDecisionState != decisionState
+						|| logState.lastDecisionLogMilliseconds < 0
+						|| nowMilliseconds - logState.lastDecisionLogMilliseconds >= 1000) {
+						logState.lastDecisionState           = decisionState;
+						logState.lastDecisionLogMilliseconds = nowMilliseconds;
+						shouldLogDecision                    = true;
+					}
+				}
+
+				if (shouldLogDecision) {
+					// logRealtime(), not log() -- see comment on the OVERLAP log above.
+					logRealtime(QString::fromLatin1(
+							"ssvr_duplicate_voice_suppression %1 stream=session:%2 kept=session:%3 channel=%4 "
+							"sessions=[%5] gate1(metadata)=%6 gate2(acoustic)=%7 reason=\"%8\"")
+							.arg(action, QString::number(suppressionResult.details.suppressedSession),
+								 QString::number(suppressionResult.details.keptSession),
+								 QString::number(suppressionResult.details.channelID), sessions.join(QLatin1String(",")),
+								 gate1State, gate2State, QString::fromStdString(suppressionResult.details.reason)));
+				}
 			}
 
 			if (suppressionResult.decision == DuplicateVoiceSuppressor::Decision::Suppress) {
@@ -1799,7 +1842,12 @@ void Server::connectionClosed(QAbstractSocket::SocketError err, const QString &r
 		if (old)
 			old->removeUser(u);
 
+		m_duplicateVoiceSuppressor.forgetSession(u->uiSession);
 		m_duplicateAudioCorrelator.forgetSession(u->uiSession);
+		{
+			QMutexLocker lock(&m_duplicateVoiceSuppressionLogMutex);
+			m_duplicateVoiceSuppressionLogStates.clear();
+		}
 	}
 
 	if (old && old->bTemporary && old->qlUsers.isEmpty())

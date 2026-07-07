@@ -16,19 +16,39 @@ constexpr double DuplicateVoiceSuppressor::MIN_STRONGER_RATIO;
 constexpr double DuplicateVoiceSuppressor::MIN_STRONGER_SCORE_DELTA;
 
 void DuplicateVoiceSuppressor::clear() {
+	std::lock_guard< std::mutex > lock(m_mutex);
 	m_activityByChannel.clear();
 	m_sessionStates.clear();
 }
 
+void DuplicateVoiceSuppressor::forgetSession(std::uint32_t sessionID) {
+	std::lock_guard< std::mutex > lock(m_mutex);
+
+	for (auto channelIt = m_activityByChannel.begin(); channelIt != m_activityByChannel.end();) {
+		channelIt->second.erase(sessionID);
+		if (channelIt->second.empty()) {
+			channelIt = m_activityByChannel.erase(channelIt);
+		} else {
+			++channelIt;
+		}
+	}
+
+	m_sessionStates.erase(sessionID);
+}
+
 void DuplicateVoiceSuppressor::setAcousticOracle(IAcousticOracle *oracle) {
+	std::lock_guard< std::mutex > lock(m_mutex);
 	m_acousticOracle = oracle;
 }
 
 void DuplicateVoiceSuppressor::setAcousticConfirmationEnabled(bool enabled) {
+	std::lock_guard< std::mutex > lock(m_mutex);
 	m_acousticConfirmationEnabled = enabled;
 }
 
 DuplicateVoiceSuppressor::Result DuplicateVoiceSuppressor::shouldForwardVoicePacket(const PacketMetadata &metadata) {
+	std::lock_guard< std::mutex > lock(m_mutex);
+
 	Result result;
 
 	if (metadata.isWhisperOrDirect) {

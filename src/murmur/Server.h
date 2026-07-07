@@ -30,6 +30,8 @@
 #	include <boost/function.hpp>
 #endif
 
+#include <cstdint>
+
 #include <QtCore/QEvent>
 #include <QtCore/QMutex>
 #include <QtCore/QQueue>
@@ -217,6 +219,15 @@ private:
 	AudioReceiverBuffer m_tcpAudioReceivers;
 	DuplicateVoiceSuppressor m_duplicateVoiceSuppressor;
 	DuplicateAudioCorrelator m_duplicateAudioCorrelator;
+
+	struct DuplicateVoiceSuppressionLogState {
+		std::int64_t lastOverlapLogMilliseconds = -1;
+		std::int64_t lastDecisionLogMilliseconds = -1;
+		QString lastDecisionState;
+	};
+
+	QMutex m_duplicateVoiceSuppressionLogMutex;
+	QHash< QString, DuplicateVoiceSuppressionLogState > m_duplicateVoiceSuppressionLogStates;
 
 public slots:
 	void regSslError(const QList< QSslError > &);
