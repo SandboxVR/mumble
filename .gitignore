@@ -46,6 +46,7 @@ doxygen/
 .DS_Store
 .directory
 build/
+/build-*/
 compile_commands.json
 # Untracked dependency source trees fetched under 3rdparty/ that are not
 # registered as git submodules (see .gitmodules for the actual submodules).
