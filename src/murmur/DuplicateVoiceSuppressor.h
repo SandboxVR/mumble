@@ -90,6 +90,7 @@ private:
 		std::size_t payloadSize            = 0;
 		std::uint64_t frameNumber          = 0;
 		double score                       = 0.0;
+		double rawScore                    = 0.0;
 		unsigned int continuityFrames      = 0;
 		bool isPrioritySpeaker             = false;
 	};
@@ -101,25 +102,25 @@ private:
 		bool suppressed                       = false;
 	};
 
+	struct PairState {
+		unsigned int weakFrames = 0;
+		std::int64_t lastSeenTimestampMilliseconds = 0;
+		std::uint32_t lastWeakerSession = 0;
+		std::uint32_t lastStrongerSession = 0;
+	};
+
 	static constexpr std::int64_t OVERLAP_WINDOW_MS = 120;
 	static constexpr std::int64_t ACOUSTIC_CAPTURE_WINDOW_MS = 250;
 	static constexpr unsigned int REQUIRED_WEAK_FRAMES = 3;
 	static constexpr unsigned int REQUIRED_RELEASE_FRAMES = 2;
-	// Gate 1 only needs to flag a *candidate* duplicate pair -- when acoustic confirmation
-	// (gate 2) is enabled, it makes the real same-source-or-not call. Real duplicate mic
-	// pickup (two mics close together capturing the same voice) tends to produce very
-	// SIMILAR payload sizes between the two streams, since both captures are near-identical
-	// quality -- the original 1.25x/8-byte thresholds below were tuned as if "stronger"
-	// meant "clearly the real speaker" on their own, which made gate 1 too strict to ever
-	// flag the closest, cleanest duplicate-mic cases (field-tested: two headsets ~15cm
-	// apart producing zero candidates at the old thresholds). Loosened so near-tied streams
-	// still produce a candidate; gate 2 is what actually protects against false positives
-	// when it's enabled.
+	static constexpr double SCORE_EMA_ALPHA = 0.3;
 	static constexpr double MIN_STRONGER_RATIO = 1.05;
 	static constexpr double MIN_STRONGER_SCORE_DELTA = 2.0;
+	static constexpr double NEAR_TIE_RATIO = 1.05;
 
 	std::unordered_map< unsigned int, std::unordered_map< std::uint32_t, Activity > > m_activityByChannel;
 	std::unordered_map< std::uint32_t, SessionState > m_sessionStates;
+	std::unordered_map< std::uint64_t, PairState > m_pairStates;
 	std::unordered_map< std::uint32_t, std::int64_t > m_acousticCaptureUntilBySession;
 
 	std::mutex m_mutex;
@@ -127,12 +128,18 @@ private:
 	bool m_acousticConfirmationEnabled = false;
 
 	void pruneChannel(unsigned int channelID, std::int64_t nowMilliseconds);
+	void prunePairStates(std::int64_t nowMilliseconds);
 	void pruneAcousticCaptureWindows(std::int64_t nowMilliseconds);
-	void updateActivity(const PacketMetadata &metadata, double score, unsigned int continuityFrames);
+	void updateActivity(const PacketMetadata &metadata, double rawScore, double smoothedScore,
+						unsigned int continuityFrames);
 	void removeActivity(const PacketMetadata &metadata);
 	double scorePacket(const PacketMetadata &metadata, const Activity *previousActivity,
 					   unsigned int &continuityFrames) const;
+	double smoothScore(double rawScore, const Activity *previousActivity) const;
+	void removePairStatesForSession(std::uint32_t sessionID);
+	static std::uint64_t pairKey(std::uint32_t sessionA, std::uint32_t sessionB);
 	static bool isClearlyStronger(double strongerScore, double weakerScore);
+	static bool isNearTie(double lhsScore, double rhsScore);
 	static const char *codecName(Mumble::Protocol::AudioCodec codec);
 };
 

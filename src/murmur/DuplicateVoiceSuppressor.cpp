@@ -31,13 +31,16 @@ constexpr std::int64_t DuplicateVoiceSuppressor::OVERLAP_WINDOW_MS;
 constexpr std::int64_t DuplicateVoiceSuppressor::ACOUSTIC_CAPTURE_WINDOW_MS;
 constexpr unsigned int DuplicateVoiceSuppressor::REQUIRED_WEAK_FRAMES;
 constexpr unsigned int DuplicateVoiceSuppressor::REQUIRED_RELEASE_FRAMES;
+constexpr double DuplicateVoiceSuppressor::SCORE_EMA_ALPHA;
 constexpr double DuplicateVoiceSuppressor::MIN_STRONGER_RATIO;
 constexpr double DuplicateVoiceSuppressor::MIN_STRONGER_SCORE_DELTA;
+constexpr double DuplicateVoiceSuppressor::NEAR_TIE_RATIO;
 
 void DuplicateVoiceSuppressor::clear() {
 	std::lock_guard< std::mutex > lock(m_mutex);
 	m_activityByChannel.clear();
 	m_sessionStates.clear();
+	m_pairStates.clear();
 	m_acousticCaptureUntilBySession.clear();
 }
 
@@ -54,6 +57,7 @@ void DuplicateVoiceSuppressor::forgetSession(std::uint32_t sessionID) {
 	}
 
 	m_sessionStates.erase(sessionID);
+	removePairStatesForSession(sessionID);
 	m_acousticCaptureUntilBySession.erase(sessionID);
 }
 
@@ -85,6 +89,7 @@ DuplicateVoiceSuppressor::Result DuplicateVoiceSuppressor::shouldForwardVoicePac
 		}
 
 		pruneChannel(metadata.channelID, metadata.timestampMilliseconds);
+		prunePairStates(metadata.timestampMilliseconds);
 		pruneAcousticCaptureWindows(metadata.timestampMilliseconds);
 
 		auto &channelActivity = m_activityByChannel[metadata.channelID];
@@ -95,7 +100,8 @@ DuplicateVoiceSuppressor::Result DuplicateVoiceSuppressor::shouldForwardVoicePac
 		}
 
 		unsigned int continuityFrames = 1;
-		const double currentScore     = scorePacket(metadata, previousActivity, continuityFrames);
+		const double currentRawScore  = scorePacket(metadata, previousActivity, continuityFrames);
+		const double currentScore     = smoothScore(currentRawScore, previousActivity);
 
 		std::vector< const Activity * > overlappingActivities;
 		overlappingActivities.reserve(channelActivity.size());
@@ -155,18 +161,63 @@ DuplicateVoiceSuppressor::Result DuplicateVoiceSuppressor::shouldForwardVoicePac
 								  [](const Activity *lhs, const Activity *rhs) { return lhs->score < rhs->score; });
 
 			const bool sameCodec = bestActivity->codec == metadata.codec;
-			const bool stronger  = bestActivity->isPrioritySpeaker || (sameCodec && isClearlyStronger(bestActivity->score, currentScore));
+			const bool otherClearlyStronger =
+				bestActivity->isPrioritySpeaker || (sameCodec && isClearlyStronger(bestActivity->score, currentScore));
+			const bool currentClearlyStronger =
+				sameCodec && isClearlyStronger(currentScore, bestActivity->score);
+			const bool nearTie = acousticEnabled && sameCodec && isNearTie(bestActivity->score, currentScore);
+			const bool currentIsWeaker =
+				currentScore < bestActivity->score
+				|| (currentScore == bestActivity->score && metadata.sessionID > bestActivity->sessionID);
+			const bool pairCandidate = otherClearlyStronger || currentClearlyStronger || nearTie;
 
 			bool acousticConfirmed     = false;
 			bool acousticCheckRan      = false;
 			bool metadataGateTriggered = false;
+			unsigned int candidateWeakFrames = 0;
+			std::uint32_t candidatePrimarySession = bestActivity->sessionID;
 
-			if (stronger) {
-				if (sessionState.candidatePrimarySession == bestActivity->sessionID) {
-					sessionState.consecutiveWeakFrames++;
+			const bool currentIsCandidateWeak =
+				pairCandidate && (otherClearlyStronger || (nearTie && currentIsWeaker));
+
+			if (pairCandidate) {
+				PairState &pairState = m_pairStates[pairKey(metadata.sessionID, bestActivity->sessionID)];
+				pairState.lastSeenTimestampMilliseconds = metadata.timestampMilliseconds;
+
+				const std::uint32_t observedWeakerSession =
+					currentIsCandidateWeak ? metadata.sessionID : bestActivity->sessionID;
+				const std::uint32_t observedStrongerSession =
+					currentIsCandidateWeak ? bestActivity->sessionID : metadata.sessionID;
+				const bool uninitializedPair = pairState.lastWeakerSession == 0 || pairState.lastStrongerSession == 0;
+				const bool sameObservedRole = pairState.lastWeakerSession == observedWeakerSession
+											  && pairState.lastStrongerSession == observedStrongerSession;
+
+				if (uninitializedPair) {
+					pairState.lastWeakerSession = observedWeakerSession;
+					pairState.lastStrongerSession = observedStrongerSession;
+					pairState.weakFrames = currentIsCandidateWeak ? 1 : 0;
+				} else if (sameObservedRole) {
+					if (currentIsCandidateWeak) {
+						pairState.weakFrames = std::min(pairState.weakFrames + 1, REQUIRED_WEAK_FRAMES);
+					}
+				} else if (pairState.weakFrames > 0) {
+					--pairState.weakFrames;
 				} else {
-					sessionState.candidatePrimarySession = bestActivity->sessionID;
-					sessionState.consecutiveWeakFrames    = 1;
+					pairState.lastWeakerSession = observedWeakerSession;
+					pairState.lastStrongerSession = observedStrongerSession;
+					pairState.weakFrames = currentIsCandidateWeak ? 1 : 0;
+				}
+
+				candidateWeakFrames = pairState.weakFrames;
+				candidatePrimarySession = pairState.lastStrongerSession;
+			}
+
+			if (currentIsCandidateWeak) {
+				if (sessionState.candidatePrimarySession == candidatePrimarySession) {
+					sessionState.consecutiveWeakFrames = candidateWeakFrames;
+				} else {
+					sessionState.candidatePrimarySession = candidatePrimarySession;
+					sessionState.consecutiveWeakFrames    = candidateWeakFrames;
 					sessionState.suppressed               = false;
 				}
 				sessionState.releaseFrames = 0;
@@ -178,7 +229,7 @@ DuplicateVoiceSuppressor::Result DuplicateVoiceSuppressor::shouldForwardVoicePac
 						acousticCheckRan = true;
 						acousticConfirmed = false;
 						acousticCheck.oracle = m_acousticOracle;
-						acousticCheck.keptSession = bestActivity->sessionID;
+						acousticCheck.keptSession = candidatePrimarySession;
 						acousticCheck.suppressedSession = metadata.sessionID;
 						acousticCheck.timestampMilliseconds = metadata.timestampMilliseconds;
 					}
@@ -205,9 +256,10 @@ DuplicateVoiceSuppressor::Result DuplicateVoiceSuppressor::shouldForwardVoicePac
 			if (result.decision == Decision::Suppress || metadataGateTriggered) {
 				result.hasDetails                 = true;
 				result.details.channelID          = metadata.channelID;
-				result.details.keptSession        = bestActivity->sessionID;
+				result.details.keptSession        = candidatePrimarySession;
 				result.details.suppressedSession  = metadata.sessionID;
-				result.details.keptScore          = bestActivity->score;
+				result.details.keptScore          =
+					candidatePrimarySession == bestActivity->sessionID ? bestActivity->score : currentScore;
 				result.details.suppressedScore    = currentScore;
 				result.details.candidateSessions  = { metadata.sessionID };
 				for (const Activity *activity : overlappingActivities) {
@@ -226,9 +278,15 @@ DuplicateVoiceSuppressor::Result DuplicateVoiceSuppressor::shouldForwardVoicePac
 				std::ostringstream reason;
 				reason << "overlap_window_ms=" << OVERLAP_WINDOW_MS << " codec=" << codecName(metadata.codec)
 					   << " consecutive_weaker_frames=" << sessionState.consecutiveWeakFrames
-					   << " payload_size=" << metadata.payloadSize;
+					   << " pair_weaker_frames=" << candidateWeakFrames
+					   << " payload_size=" << metadata.payloadSize
+					   << " raw_score=" << currentRawScore
+					   << " smoothed_score=" << currentScore;
 				if (bestActivity->isPrioritySpeaker) {
 					reason << " kept_is_priority_speaker=true";
+				}
+				if (nearTie) {
+					reason << " near_tie=true";
 				}
 				result.details.reason = reason.str();
 			}
@@ -243,7 +301,7 @@ DuplicateVoiceSuppressor::Result DuplicateVoiceSuppressor::shouldForwardVoicePac
 			}
 		}
 
-		updateActivity(metadata, currentScore, continuityFrames);
+		updateActivity(metadata, currentRawScore, currentScore, continuityFrames);
 	}
 
 	if (acousticSubmission.oracle != nullptr) {
@@ -294,6 +352,16 @@ void DuplicateVoiceSuppressor::pruneChannel(unsigned int channelID, std::int64_t
 	}
 }
 
+void DuplicateVoiceSuppressor::prunePairStates(std::int64_t nowMilliseconds) {
+	for (auto it = m_pairStates.begin(); it != m_pairStates.end();) {
+		if (nowMilliseconds - it->second.lastSeenTimestampMilliseconds > OVERLAP_WINDOW_MS) {
+			it = m_pairStates.erase(it);
+		} else {
+			++it;
+		}
+	}
+}
+
 void DuplicateVoiceSuppressor::pruneAcousticCaptureWindows(std::int64_t nowMilliseconds) {
 	for (auto it = m_acousticCaptureUntilBySession.begin(); it != m_acousticCaptureUntilBySession.end();) {
 		if (nowMilliseconds > it->second) {
@@ -304,7 +372,7 @@ void DuplicateVoiceSuppressor::pruneAcousticCaptureWindows(std::int64_t nowMilli
 	}
 }
 
-void DuplicateVoiceSuppressor::updateActivity(const PacketMetadata &metadata, double score,
+void DuplicateVoiceSuppressor::updateActivity(const PacketMetadata &metadata, double rawScore, double smoothedScore,
 											  unsigned int continuityFrames) {
 	Activity activity;
 	activity.sessionID             = metadata.sessionID;
@@ -313,7 +381,8 @@ void DuplicateVoiceSuppressor::updateActivity(const PacketMetadata &metadata, do
 	activity.codec                  = metadata.codec;
 	activity.payloadSize            = metadata.payloadSize;
 	activity.frameNumber            = metadata.frameNumber;
-	activity.score                  = score;
+	activity.score                  = smoothedScore;
+	activity.rawScore               = rawScore;
 	activity.continuityFrames       = continuityFrames;
 	activity.isPrioritySpeaker      = metadata.isPrioritySpeaker;
 
@@ -329,6 +398,7 @@ void DuplicateVoiceSuppressor::removeActivity(const PacketMetadata &metadata) {
 		}
 	}
 	m_sessionStates.erase(metadata.sessionID);
+	removePairStatesForSession(metadata.sessionID);
 	m_acousticCaptureUntilBySession.erase(metadata.sessionID);
 }
 
@@ -357,9 +427,41 @@ double DuplicateVoiceSuppressor::scorePacket(const PacketMetadata &metadata, con
 	return score;
 }
 
+double DuplicateVoiceSuppressor::smoothScore(double rawScore, const Activity *previousActivity) const {
+	if (!previousActivity) {
+		return rawScore;
+	}
+
+	return previousActivity->score + SCORE_EMA_ALPHA * (rawScore - previousActivity->score);
+}
+
+void DuplicateVoiceSuppressor::removePairStatesForSession(std::uint32_t sessionID) {
+	for (auto it = m_pairStates.begin(); it != m_pairStates.end();) {
+		const std::uint32_t first = static_cast< std::uint32_t >(it->first >> 32);
+		const std::uint32_t second = static_cast< std::uint32_t >(it->first & 0xffffffffu);
+		if (first == sessionID || second == sessionID) {
+			it = m_pairStates.erase(it);
+		} else {
+			++it;
+		}
+	}
+}
+
+std::uint64_t DuplicateVoiceSuppressor::pairKey(std::uint32_t sessionA, std::uint32_t sessionB) {
+	const std::uint32_t first = std::min(sessionA, sessionB);
+	const std::uint32_t second = std::max(sessionA, sessionB);
+	return (static_cast< std::uint64_t >(first) << 32) | second;
+}
+
 bool DuplicateVoiceSuppressor::isClearlyStronger(double strongerScore, double weakerScore) {
 	return strongerScore >= weakerScore * MIN_STRONGER_RATIO
 		   && strongerScore - weakerScore >= MIN_STRONGER_SCORE_DELTA;
+}
+
+bool DuplicateVoiceSuppressor::isNearTie(double lhsScore, double rhsScore) {
+	const double strongerScore = std::max(lhsScore, rhsScore);
+	const double weakerScore = std::min(lhsScore, rhsScore);
+	return strongerScore <= weakerScore * NEAR_TIE_RATIO;
 }
 
 const char *DuplicateVoiceSuppressor::codecName(Mumble::Protocol::AudioCodec codec) {
