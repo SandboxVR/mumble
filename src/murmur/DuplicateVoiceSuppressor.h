@@ -50,6 +50,7 @@ public:
 		// frame, and if so, whether it confirmed (vs. vetoed) gate 1's candidate.
 		bool acousticGateRan       = false;
 		bool acousticGateConfirmed = false;
+		bool releaseComplete = false;
 		// Meaningful only when acousticGateRan is true; -1.0 otherwise.
 		double correlationScore = -1.0;
 		std::string reason;
@@ -59,7 +60,7 @@ public:
 		Decision decision = Decision::NoDecision;
 		DecisionDetails details;
 		bool hasDetails = false;
-		// True whenever this packet's session overlaps in time (within OVERLAP_WINDOW_MS,
+		// True whenever this packet's session overlaps in time (within the configured overlap window,
 		// same channel) with at least one other session's recent packet -- regardless of
 		// whether gate 1 (metadata heuristic) or gate 2 (acoustic) ever reach a mute/veto
 		// decision. Fires far earlier and more cheaply than hasDetails; useful to confirm
@@ -70,9 +71,21 @@ public:
 		std::vector< std::uint32_t > overlappingSessions;
 	};
 
+	static constexpr std::int64_t DEFAULT_OVERLAP_WINDOW_MS = 120;
+	static constexpr unsigned int DEFAULT_REQUIRED_WEAK_FRAMES = 3;
+	static constexpr unsigned int DEFAULT_REQUIRED_RELEASE_FRAMES = 2;
+
+	struct Config {
+		std::int64_t overlapWindowMilliseconds = DEFAULT_OVERLAP_WINDOW_MS;
+		unsigned int requiredWeakFrames = DEFAULT_REQUIRED_WEAK_FRAMES;
+		unsigned int requiredReleaseFrames = DEFAULT_REQUIRED_RELEASE_FRAMES;
+	};
+
 	Result shouldForwardVoicePacket(const PacketMetadata &metadata);
 	void clear();
 	void forgetSession(std::uint32_t sessionID);
+	void setConfig(const Config &config);
+	Config config() const;
 
 	// Non-owning; the caller (Server) owns the real oracle and must outlive its use here.
 	// Pass nullptr to disable (default). See setAcousticConfirmationEnabled() -- acoustic
@@ -109,10 +122,7 @@ private:
 		std::uint32_t lastStrongerSession = 0;
 	};
 
-	static constexpr std::int64_t OVERLAP_WINDOW_MS = 120;
 	static constexpr std::int64_t ACOUSTIC_CAPTURE_WINDOW_MS = 250;
-	static constexpr unsigned int REQUIRED_WEAK_FRAMES = 3;
-	static constexpr unsigned int REQUIRED_RELEASE_FRAMES = 2;
 	static constexpr double SCORE_EMA_ALPHA = 0.3;
 	static constexpr double MIN_STRONGER_RATIO = 1.05;
 	static constexpr double MIN_STRONGER_SCORE_DELTA = 2.0;
@@ -123,9 +133,10 @@ private:
 	std::unordered_map< std::uint64_t, PairState > m_pairStates;
 	std::unordered_map< std::uint32_t, std::int64_t > m_acousticCaptureUntilBySession;
 
-	std::mutex m_mutex;
+	mutable std::mutex m_mutex;
 	IAcousticOracle *m_acousticOracle          = nullptr;
 	bool m_acousticConfirmationEnabled = false;
+	Config m_config;
 
 	void pruneChannel(unsigned int channelID, std::int64_t nowMilliseconds);
 	void prunePairStates(std::int64_t nowMilliseconds);

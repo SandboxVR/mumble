@@ -107,6 +107,11 @@ public:
 	bool broadcastListenerVolumeAdjustments;
 	bool ssvrDuplicateVoiceSuppression;
 	bool ssvrDuplicateVoiceSuppressionAcoustic;
+	double ssvrDuplicateVoiceSuppressionCorrelationThreshold;
+	int ssvrDuplicateVoiceSuppressionOverlapWindowMs;
+	unsigned int ssvrDuplicateVoiceSuppressionWeakFrames;
+	unsigned int ssvrDuplicateVoiceSuppressionReleaseFrames;
+	int ssvrDuplicateVoiceSuppressionVerdictCacheMs;
 
 	QSslCertificate qscCert;
 	QSslKey qskKey;

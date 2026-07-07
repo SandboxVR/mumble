@@ -31,6 +31,7 @@
 #endif
 
 #include <cstdint>
+#include <vector>
 
 #include <QtCore/QEvent>
 #include <QtCore/QMutex>
@@ -153,6 +154,11 @@ public:
 	bool broadcastListenerVolumeAdjustments;
 	bool ssvrDuplicateVoiceSuppression;
 	bool ssvrDuplicateVoiceSuppressionAcoustic;
+	double ssvrDuplicateVoiceSuppressionCorrelationThreshold;
+	int ssvrDuplicateVoiceSuppressionOverlapWindowMs;
+	unsigned int ssvrDuplicateVoiceSuppressionWeakFrames;
+	unsigned int ssvrDuplicateVoiceSuppressionReleaseFrames;
+	int ssvrDuplicateVoiceSuppressionVerdictCacheMs;
 
 	Version::full_t m_suggestVersion;
 
@@ -223,11 +229,15 @@ private:
 	struct DuplicateVoiceSuppressionLogState {
 		std::int64_t lastOverlapLogMilliseconds = -1;
 		std::int64_t lastDecisionLogMilliseconds = -1;
+		std::int64_t lastScoreHistogramLogMilliseconds = -1;
 		QString lastDecisionState;
+		std::vector< double > correlationScores;
 	};
 
 	QMutex m_duplicateVoiceSuppressionLogMutex;
 	QHash< QString, DuplicateVoiceSuppressionLogState > m_duplicateVoiceSuppressionLogStates;
+
+	void applyDuplicateVoiceSuppressionConfig();
 
 public slots:
 	void regSslError(const QList< QSslError > &);

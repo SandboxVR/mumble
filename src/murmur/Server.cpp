@@ -351,6 +351,13 @@ void Server::readParams() {
 	broadcastListenerVolumeAdjustments = Meta::mp.broadcastListenerVolumeAdjustments;
 	ssvrDuplicateVoiceSuppression      = Meta::mp.ssvrDuplicateVoiceSuppression;
 	ssvrDuplicateVoiceSuppressionAcoustic = Meta::mp.ssvrDuplicateVoiceSuppressionAcoustic;
+	ssvrDuplicateVoiceSuppressionCorrelationThreshold =
+		Meta::mp.ssvrDuplicateVoiceSuppressionCorrelationThreshold;
+	ssvrDuplicateVoiceSuppressionOverlapWindowMs =
+		Meta::mp.ssvrDuplicateVoiceSuppressionOverlapWindowMs;
+	ssvrDuplicateVoiceSuppressionWeakFrames = Meta::mp.ssvrDuplicateVoiceSuppressionWeakFrames;
+	ssvrDuplicateVoiceSuppressionReleaseFrames = Meta::mp.ssvrDuplicateVoiceSuppressionReleaseFrames;
+	ssvrDuplicateVoiceSuppressionVerdictCacheMs = Meta::mp.ssvrDuplicateVoiceSuppressionVerdictCacheMs;
 	m_suggestVersion                   = Meta::mp.m_suggestVersion;
 	qvSuggestPositional                = Meta::mp.qvSuggestPositional;
 	qvSuggestPushToTalk                = Meta::mp.qvSuggestPushToTalk;
@@ -473,7 +480,23 @@ void Server::readParams() {
 		getConf("ssvr_duplicate_voice_suppression", ssvrDuplicateVoiceSuppression).toBool();
 	ssvrDuplicateVoiceSuppressionAcoustic =
 		getConf("ssvr_duplicate_voice_suppression_acoustic", ssvrDuplicateVoiceSuppressionAcoustic).toBool();
+	ssvrDuplicateVoiceSuppressionCorrelationThreshold =
+		getConf("ssvr_duplicate_voice_suppression_correlation_threshold",
+				ssvrDuplicateVoiceSuppressionCorrelationThreshold).toDouble();
+	ssvrDuplicateVoiceSuppressionOverlapWindowMs =
+		getConf("ssvr_duplicate_voice_suppression_overlap_window_ms",
+				ssvrDuplicateVoiceSuppressionOverlapWindowMs).toInt();
+	ssvrDuplicateVoiceSuppressionWeakFrames =
+		getConf("ssvr_duplicate_voice_suppression_weak_frames",
+				ssvrDuplicateVoiceSuppressionWeakFrames).toUInt();
+	ssvrDuplicateVoiceSuppressionReleaseFrames =
+		getConf("ssvr_duplicate_voice_suppression_release_frames",
+				ssvrDuplicateVoiceSuppressionReleaseFrames).toUInt();
+	ssvrDuplicateVoiceSuppressionVerdictCacheMs =
+		getConf("ssvr_duplicate_voice_suppression_verdict_cache_ms",
+				ssvrDuplicateVoiceSuppressionVerdictCacheMs).toInt();
 	m_duplicateVoiceSuppressor.setAcousticOracle(&m_duplicateAudioCorrelator);
+	applyDuplicateVoiceSuppressionConfig();
 	m_duplicateVoiceSuppressor.setAcousticConfirmationEnabled(ssvrDuplicateVoiceSuppression
 																&& ssvrDuplicateVoiceSuppressionAcoustic);
 	log(QString::fromLatin1(
@@ -485,6 +508,38 @@ void Server::readParams() {
 			.arg((ssvrDuplicateVoiceSuppression && ssvrDuplicateVoiceSuppressionAcoustic)
 					 ? QLatin1String("true")
 					 : QLatin1String("false")));
+}
+
+void Server::applyDuplicateVoiceSuppressionConfig() {
+	ssvrDuplicateVoiceSuppressionCorrelationThreshold =
+		std::max(0.0, ssvrDuplicateVoiceSuppressionCorrelationThreshold);
+	ssvrDuplicateVoiceSuppressionOverlapWindowMs =
+		std::max(1, ssvrDuplicateVoiceSuppressionOverlapWindowMs);
+	ssvrDuplicateVoiceSuppressionWeakFrames =
+		std::max(1u, ssvrDuplicateVoiceSuppressionWeakFrames);
+	ssvrDuplicateVoiceSuppressionReleaseFrames =
+		std::max(1u, ssvrDuplicateVoiceSuppressionReleaseFrames);
+	ssvrDuplicateVoiceSuppressionVerdictCacheMs =
+		std::max(0, ssvrDuplicateVoiceSuppressionVerdictCacheMs);
+
+	DuplicateVoiceSuppressor::Config suppressorConfig;
+	suppressorConfig.overlapWindowMilliseconds = ssvrDuplicateVoiceSuppressionOverlapWindowMs;
+	suppressorConfig.requiredWeakFrames = ssvrDuplicateVoiceSuppressionWeakFrames;
+	suppressorConfig.requiredReleaseFrames = ssvrDuplicateVoiceSuppressionReleaseFrames;
+	m_duplicateVoiceSuppressor.setConfig(suppressorConfig);
+
+	DuplicateAudioCorrelator::Config correlatorConfig;
+	correlatorConfig.correlationThreshold = ssvrDuplicateVoiceSuppressionCorrelationThreshold;
+	correlatorConfig.verdictCacheMilliseconds = ssvrDuplicateVoiceSuppressionVerdictCacheMs;
+	m_duplicateAudioCorrelator.setConfig(correlatorConfig);
+
+	log(QString::fromLatin1("ssvr_duplicate_voice_suppression tuning correlation_threshold=%1 "
+							"overlap_window_ms=%2 weak_frames=%3 release_frames=%4 verdict_cache_ms=%5")
+			.arg(ssvrDuplicateVoiceSuppressionCorrelationThreshold, 0, 'f', 2)
+			.arg(ssvrDuplicateVoiceSuppressionOverlapWindowMs)
+			.arg(ssvrDuplicateVoiceSuppressionWeakFrames)
+			.arg(ssvrDuplicateVoiceSuppressionReleaseFrames)
+			.arg(ssvrDuplicateVoiceSuppressionVerdictCacheMs));
 }
 
 void Server::setLiveConf(const QString &key, const QString &value) {
@@ -643,6 +698,26 @@ void Server::setLiveConf(const QString &key, const QString &value) {
 				.arg((ssvrDuplicateVoiceSuppression && ssvrDuplicateVoiceSuppressionAcoustic)
 						 ? QLatin1String("true")
 						 : QLatin1String("false")));
+	} else if (key == "ssvr_duplicate_voice_suppression_correlation_threshold") {
+		ssvrDuplicateVoiceSuppressionCorrelationThreshold =
+			(!v.isNull() ? v.toDouble() : Meta::mp.ssvrDuplicateVoiceSuppressionCorrelationThreshold);
+		applyDuplicateVoiceSuppressionConfig();
+	} else if (key == "ssvr_duplicate_voice_suppression_overlap_window_ms") {
+		ssvrDuplicateVoiceSuppressionOverlapWindowMs =
+			(!v.isNull() ? v.toInt() : Meta::mp.ssvrDuplicateVoiceSuppressionOverlapWindowMs);
+		applyDuplicateVoiceSuppressionConfig();
+	} else if (key == "ssvr_duplicate_voice_suppression_weak_frames") {
+		ssvrDuplicateVoiceSuppressionWeakFrames =
+			(!v.isNull() ? v.toUInt() : Meta::mp.ssvrDuplicateVoiceSuppressionWeakFrames);
+		applyDuplicateVoiceSuppressionConfig();
+	} else if (key == "ssvr_duplicate_voice_suppression_release_frames") {
+		ssvrDuplicateVoiceSuppressionReleaseFrames =
+			(!v.isNull() ? v.toUInt() : Meta::mp.ssvrDuplicateVoiceSuppressionReleaseFrames);
+		applyDuplicateVoiceSuppressionConfig();
+	} else if (key == "ssvr_duplicate_voice_suppression_verdict_cache_ms") {
+		ssvrDuplicateVoiceSuppressionVerdictCacheMs =
+			(!v.isNull() ? v.toInt() : Meta::mp.ssvrDuplicateVoiceSuppressionVerdictCacheMs);
+		applyDuplicateVoiceSuppressionConfig();
 	}
 }
 
@@ -1279,10 +1354,14 @@ void Server::processMsg(ServerUser *u, Mumble::Protocol::AudioData audioData, Au
 				// consulted (disabled, or gate 1 didn't reach a decision point), confirmed
 				// gate 1's candidate, or vetoed it (audio is NOT muted in that case).
 				const bool muted      = suppressionResult.decision == DuplicateVoiceSuppressor::Decision::Suppress;
-				const QString action  = muted ? QLatin1String("MUTE") : QLatin1String("VETO");
-				const QString gate1State = suppressionResult.details.metadataGateTriggered
-												? QLatin1String("triggered")
-												: QLatin1String("releasing");
+				const QString action  = suppressionResult.details.releaseComplete
+											? QLatin1String("UNMUTE")
+											: (muted ? QLatin1String("MUTE") : QLatin1String("VETO"));
+				const QString gate1State = suppressionResult.details.releaseComplete
+												? QLatin1String("released")
+												: (suppressionResult.details.metadataGateTriggered
+													   ? QLatin1String("triggered")
+													   : QLatin1String("releasing"));
 				QString gate2State;
 				if (!suppressionResult.details.acousticGateRan) {
 					gate2State = QLatin1String("not_consulted");
@@ -1326,6 +1405,52 @@ void Server::processMsg(ServerUser *u, Mumble::Protocol::AudioData audioData, Au
 								 QString::number(suppressionResult.details.keptSession),
 								 QString::number(suppressionResult.details.channelID), sessions.join(QLatin1String(",")),
 								 gate1State, gate2State, QString::fromStdString(suppressionResult.details.reason)));
+				}
+
+				if (suppressionResult.details.acousticGateRan && suppressionResult.details.correlationScore >= 0.0) {
+					bool shouldLogScoreHistogram = false;
+					int scoreCount = 0;
+					double minScore = 0.0;
+					double medianScore = 0.0;
+					double maxScore = 0.0;
+
+					{
+						QMutexLocker lock(&m_duplicateVoiceSuppressionLogMutex);
+						const QString logKey = QString::fromLatin1("score:%1:%2:%3")
+												   .arg(QString::number(suppressionResult.details.channelID),
+														QString::number(suppressionResult.details.suppressedSession),
+														QString::number(suppressionResult.details.keptSession));
+						DuplicateVoiceSuppressionLogState &logState = m_duplicateVoiceSuppressionLogStates[logKey];
+						if (logState.lastScoreHistogramLogMilliseconds < 0) {
+							logState.lastScoreHistogramLogMilliseconds = nowMilliseconds;
+						}
+
+						logState.correlationScores.push_back(suppressionResult.details.correlationScore);
+						if (nowMilliseconds - logState.lastScoreHistogramLogMilliseconds >= 10000) {
+							std::vector< double > scores = logState.correlationScores;
+							std::sort(scores.begin(), scores.end());
+							scoreCount = static_cast< int >(scores.size());
+							minScore = scores.front();
+							medianScore = scores[scores.size() / 2];
+							maxScore = scores.back();
+
+							logState.correlationScores.clear();
+							logState.lastScoreHistogramLogMilliseconds = nowMilliseconds;
+							shouldLogScoreHistogram = true;
+						}
+					}
+
+					if (shouldLogScoreHistogram) {
+						logRealtime(QString::fromLatin1(
+								"ssvr_duplicate_voice_suppression score_histogram stream=session:%1 "
+								"kept=session:%2 channel=%3 samples=%4 window_ms=10000 min=%5 median=%6 max=%7")
+								.arg(QString::number(suppressionResult.details.suppressedSession),
+									 QString::number(suppressionResult.details.keptSession),
+									 QString::number(suppressionResult.details.channelID), QString::number(scoreCount))
+								.arg(minScore, 0, 'f', 2)
+								.arg(medianScore, 0, 'f', 2)
+								.arg(maxScore, 0, 'f', 2));
+					}
 				}
 			}
 

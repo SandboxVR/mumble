@@ -27,10 +27,7 @@ struct AcousticCheck {
 };
 } // namespace
 
-constexpr std::int64_t DuplicateVoiceSuppressor::OVERLAP_WINDOW_MS;
 constexpr std::int64_t DuplicateVoiceSuppressor::ACOUSTIC_CAPTURE_WINDOW_MS;
-constexpr unsigned int DuplicateVoiceSuppressor::REQUIRED_WEAK_FRAMES;
-constexpr unsigned int DuplicateVoiceSuppressor::REQUIRED_RELEASE_FRAMES;
 constexpr double DuplicateVoiceSuppressor::SCORE_EMA_ALPHA;
 constexpr double DuplicateVoiceSuppressor::MIN_STRONGER_RATIO;
 constexpr double DuplicateVoiceSuppressor::MIN_STRONGER_SCORE_DELTA;
@@ -69,6 +66,19 @@ void DuplicateVoiceSuppressor::setAcousticOracle(IAcousticOracle *oracle) {
 void DuplicateVoiceSuppressor::setAcousticConfirmationEnabled(bool enabled) {
 	std::lock_guard< std::mutex > lock(m_mutex);
 	m_acousticConfirmationEnabled = enabled;
+}
+
+void DuplicateVoiceSuppressor::setConfig(const Config &config) {
+	std::lock_guard< std::mutex > lock(m_mutex);
+	m_config.overlapWindowMilliseconds =
+		std::max< std::int64_t >(1, config.overlapWindowMilliseconds);
+	m_config.requiredWeakFrames = std::max(1u, config.requiredWeakFrames);
+	m_config.requiredReleaseFrames = std::max(1u, config.requiredReleaseFrames);
+}
+
+DuplicateVoiceSuppressor::Config DuplicateVoiceSuppressor::config() const {
+	std::lock_guard< std::mutex > lock(m_mutex);
+	return m_config;
 }
 
 DuplicateVoiceSuppressor::Result DuplicateVoiceSuppressor::shouldForwardVoicePacket(const PacketMetadata &metadata) {
@@ -112,7 +122,7 @@ DuplicateVoiceSuppressor::Result DuplicateVoiceSuppressor::shouldForwardVoicePac
 			}
 
 			const std::int64_t age = metadata.timestampMilliseconds - activity.timestampMilliseconds;
-			if (age >= 0 && age <= OVERLAP_WINDOW_MS && activity.channelID == metadata.channelID) {
+			if (age >= 0 && age <= m_config.overlapWindowMilliseconds && activity.channelID == metadata.channelID) {
 				overlappingActivities.push_back(&activity);
 			}
 		}
@@ -198,7 +208,7 @@ DuplicateVoiceSuppressor::Result DuplicateVoiceSuppressor::shouldForwardVoicePac
 					pairState.weakFrames = currentIsCandidateWeak ? 1 : 0;
 				} else if (sameObservedRole) {
 					if (currentIsCandidateWeak) {
-						pairState.weakFrames = std::min(pairState.weakFrames + 1, REQUIRED_WEAK_FRAMES);
+						pairState.weakFrames = std::min(pairState.weakFrames + 1, m_config.requiredWeakFrames);
 					}
 				} else if (pairState.weakFrames > 0) {
 					--pairState.weakFrames;
@@ -222,7 +232,7 @@ DuplicateVoiceSuppressor::Result DuplicateVoiceSuppressor::shouldForwardVoicePac
 				}
 				sessionState.releaseFrames = 0;
 
-				if (sessionState.consecutiveWeakFrames >= REQUIRED_WEAK_FRAMES) {
+				if (sessionState.consecutiveWeakFrames >= m_config.requiredWeakFrames) {
 					metadataGateTriggered = true;
 					acousticConfirmed     = true;
 					if (acousticEnabled) {
@@ -241,10 +251,29 @@ DuplicateVoiceSuppressor::Result DuplicateVoiceSuppressor::shouldForwardVoicePac
 				}
 			} else if (sessionState.suppressed && sessionState.candidatePrimarySession != 0) {
 				sessionState.releaseFrames++;
-				if (sessionState.releaseFrames < REQUIRED_RELEASE_FRAMES) {
+				const std::uint32_t releasedPrimarySession = sessionState.candidatePrimarySession;
+				const unsigned int releaseFrames = sessionState.releaseFrames;
+				if (releaseFrames < m_config.requiredReleaseFrames) {
 					result.decision = Decision::Suppress;
 				} else {
 					sessionState = SessionState();
+					result.decision = Decision::Forward;
+					result.hasDetails = true;
+					result.details.channelID = metadata.channelID;
+					result.details.keptSession = releasedPrimarySession;
+					result.details.suppressedSession = metadata.sessionID;
+					result.details.keptScore =
+						releasedPrimarySession == bestActivity->sessionID ? bestActivity->score : currentScore;
+					result.details.suppressedScore = currentScore;
+					result.details.candidateSessions = { metadata.sessionID, releasedPrimarySession };
+					std::sort(result.details.candidateSessions.begin(), result.details.candidateSessions.end());
+					result.details.candidateSessions.erase(
+						std::unique(result.details.candidateSessions.begin(), result.details.candidateSessions.end()),
+						result.details.candidateSessions.end());
+					result.details.releaseComplete = true;
+					result.details.reason =
+						"release_complete=true release_frames=" + std::to_string(releaseFrames)
+						+ " required_release_frames=" + std::to_string(m_config.requiredReleaseFrames);
 				}
 			} else {
 				sessionState = SessionState();
@@ -253,7 +282,7 @@ DuplicateVoiceSuppressor::Result DuplicateVoiceSuppressor::shouldForwardVoicePac
 			// Report whenever gate 1 actively muted/continued-muting a stream (Suppress)
 			// OR gate 1 wanted to mute this frame but gate 2 vetoed it (metadataGateTriggered
 			// without Suppress).
-			if (result.decision == Decision::Suppress || metadataGateTriggered) {
+			if (!result.hasDetails && (result.decision == Decision::Suppress || metadataGateTriggered)) {
 				result.hasDetails                 = true;
 				result.details.channelID          = metadata.channelID;
 				result.details.keptSession        = candidatePrimarySession;
@@ -276,7 +305,7 @@ DuplicateVoiceSuppressor::Result DuplicateVoiceSuppressor::shouldForwardVoicePac
 				result.details.correlationScore      = -1.0;
 
 				std::ostringstream reason;
-				reason << "overlap_window_ms=" << OVERLAP_WINDOW_MS << " codec=" << codecName(metadata.codec)
+				reason << "overlap_window_ms=" << m_config.overlapWindowMilliseconds << " codec=" << codecName(metadata.codec)
 					   << " consecutive_weaker_frames=" << sessionState.consecutiveWeakFrames
 					   << " pair_weaker_frames=" << candidateWeakFrames
 					   << " payload_size=" << metadata.payloadSize
@@ -293,7 +322,7 @@ DuplicateVoiceSuppressor::Result DuplicateVoiceSuppressor::shouldForwardVoicePac
 		} else {
 			if (sessionState.suppressed) {
 				sessionState.releaseFrames++;
-				if (sessionState.releaseFrames >= REQUIRED_RELEASE_FRAMES) {
+				if (sessionState.releaseFrames >= m_config.requiredReleaseFrames) {
 					sessionState = SessionState();
 				}
 			} else {
@@ -322,7 +351,7 @@ DuplicateVoiceSuppressor::Result DuplicateVoiceSuppressor::shouldForwardVoicePac
 			std::lock_guard< std::mutex > lock(m_mutex);
 			SessionState &sessionState = m_sessionStates[acousticCheck.suppressedSession];
 			if (sessionState.candidatePrimarySession == acousticCheck.keptSession
-				&& sessionState.consecutiveWeakFrames >= REQUIRED_WEAK_FRAMES) {
+				&& sessionState.consecutiveWeakFrames >= m_config.requiredWeakFrames) {
 				sessionState.suppressed = true;
 				result.decision = Decision::Suppress;
 			}
@@ -340,7 +369,7 @@ void DuplicateVoiceSuppressor::pruneChannel(unsigned int channelID, std::int64_t
 
 	auto &channelActivity = channelIt->second;
 	for (auto it = channelActivity.begin(); it != channelActivity.end();) {
-		if (nowMilliseconds - it->second.timestampMilliseconds > OVERLAP_WINDOW_MS) {
+		if (nowMilliseconds - it->second.timestampMilliseconds > m_config.overlapWindowMilliseconds) {
 			it = channelActivity.erase(it);
 		} else {
 			++it;
@@ -354,7 +383,7 @@ void DuplicateVoiceSuppressor::pruneChannel(unsigned int channelID, std::int64_t
 
 void DuplicateVoiceSuppressor::prunePairStates(std::int64_t nowMilliseconds) {
 	for (auto it = m_pairStates.begin(); it != m_pairStates.end();) {
-		if (nowMilliseconds - it->second.lastSeenTimestampMilliseconds > OVERLAP_WINDOW_MS) {
+		if (nowMilliseconds - it->second.lastSeenTimestampMilliseconds > m_config.overlapWindowMilliseconds) {
 			it = m_pairStates.erase(it);
 		} else {
 			++it;
@@ -410,7 +439,7 @@ double DuplicateVoiceSuppressor::scorePacket(const PacketMetadata &metadata, con
 			metadata.frameNumber > previousActivity->frameNumber && metadata.frameNumber - previousActivity->frameNumber <= 3;
 		const bool timeContinuity =
 			metadata.timestampMilliseconds >= previousActivity->timestampMilliseconds
-			&& metadata.timestampMilliseconds - previousActivity->timestampMilliseconds <= OVERLAP_WINDOW_MS;
+			&& metadata.timestampMilliseconds - previousActivity->timestampMilliseconds <= m_config.overlapWindowMilliseconds;
 
 		if (frameContinuity || timeContinuity) {
 			continuityFrames = std::min(previousActivity->continuityFrames + 1, 8u);

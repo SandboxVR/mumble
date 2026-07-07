@@ -21,6 +21,18 @@ DuplicateAudioCorrelator::~DuplicateAudioCorrelator() {
 	}
 }
 
+void DuplicateAudioCorrelator::setConfig(const Config &config) {
+	std::lock_guard< std::mutex > lock(m_mutex);
+	m_config.correlationThreshold = std::max(0.0, config.correlationThreshold);
+	m_config.verdictCacheMilliseconds = std::max< std::int64_t >(0, config.verdictCacheMilliseconds);
+	m_cachedVerdicts.clear();
+}
+
+DuplicateAudioCorrelator::Config DuplicateAudioCorrelator::config() const {
+	std::lock_guard< std::mutex > lock(m_mutex);
+	return m_config;
+}
+
 void DuplicateAudioCorrelator::submitPacket(std::uint32_t sessionID, Mumble::Protocol::AudioCodec codec,
 											 const unsigned char *payload, std::size_t payloadSize,
 											 std::int64_t timestampMilliseconds) {
@@ -79,16 +91,18 @@ bool DuplicateAudioCorrelator::isLikelySameSource(std::uint32_t sessionA, std::u
 												   std::int64_t nowMilliseconds) {
 	HistorySnapshot snapshotA;
 	HistorySnapshot snapshotB;
+	Config config;
 
 	const std::uint64_t cacheKey = pairKey(sessionA, sessionB);
 
 	{
 		std::lock_guard< std::mutex > lock(m_mutex);
 		m_lastCorrelationScore = -1.0;
+		config = m_config;
 
 		auto cacheIt = m_cachedVerdicts.find(cacheKey);
 		if (cacheIt != m_cachedVerdicts.end()
-			&& nowMilliseconds - cacheIt->second.timestampMilliseconds <= VERDICT_CACHE_MS) {
+			&& nowMilliseconds - cacheIt->second.timestampMilliseconds <= config.verdictCacheMilliseconds) {
 			m_lastCorrelationScore = cacheIt->second.score;
 			return cacheIt->second.confirmed;
 		}
@@ -134,7 +148,7 @@ bool DuplicateAudioCorrelator::isLikelySameSource(std::uint32_t sessionA, std::u
 
 	const double score = normalizedEnvelopeCorrelationPeak(envelopeA, envelopeB, expectedLagEnvelopeHops,
 														   MAX_RESIDUAL_LAG_ENVELOPE_HOPS);
-	const bool confirmed = score >= CORRELATION_THRESHOLD;
+	const bool confirmed = score >= config.correlationThreshold;
 
 	{
 		std::lock_guard< std::mutex > lock(m_mutex);

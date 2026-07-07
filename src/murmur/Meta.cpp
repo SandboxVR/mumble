@@ -110,6 +110,14 @@ MetaParams::MetaParams() {
 	ssvrDuplicateVoiceSuppression      = false;
 	// Opt-in, and only meaningful when ssvrDuplicateVoiceSuppression above is also true.
 	ssvrDuplicateVoiceSuppressionAcoustic = false;
+	ssvrDuplicateVoiceSuppressionCorrelationThreshold =
+		DuplicateAudioCorrelator::DEFAULT_CORRELATION_THRESHOLD;
+	ssvrDuplicateVoiceSuppressionOverlapWindowMs =
+		static_cast< int >(DuplicateVoiceSuppressor::DEFAULT_OVERLAP_WINDOW_MS);
+	ssvrDuplicateVoiceSuppressionWeakFrames = DuplicateVoiceSuppressor::DEFAULT_REQUIRED_WEAK_FRAMES;
+	ssvrDuplicateVoiceSuppressionReleaseFrames = DuplicateVoiceSuppressor::DEFAULT_REQUIRED_RELEASE_FRAMES;
+	ssvrDuplicateVoiceSuppressionVerdictCacheMs =
+		static_cast< int >(DuplicateAudioCorrelator::DEFAULT_VERDICT_CACHE_MS);
 
 	qsCiphers = MumbleSSL::defaultOpenSSLCipherString();
 
@@ -383,6 +391,21 @@ void MetaParams::read(QString fname) {
 	ssvrDuplicateVoiceSuppression      = typeCheckedFromSettings("ssvr_duplicate_voice_suppression", false);
 	ssvrDuplicateVoiceSuppressionAcoustic =
 		typeCheckedFromSettings("ssvr_duplicate_voice_suppression_acoustic", false);
+	ssvrDuplicateVoiceSuppressionCorrelationThreshold =
+		typeCheckedFromSettings("ssvr_duplicate_voice_suppression_correlation_threshold",
+								DuplicateAudioCorrelator::DEFAULT_CORRELATION_THRESHOLD);
+	ssvrDuplicateVoiceSuppressionOverlapWindowMs =
+		typeCheckedFromSettings("ssvr_duplicate_voice_suppression_overlap_window_ms",
+								static_cast< int >(DuplicateVoiceSuppressor::DEFAULT_OVERLAP_WINDOW_MS));
+	ssvrDuplicateVoiceSuppressionWeakFrames =
+		typeCheckedFromSettings("ssvr_duplicate_voice_suppression_weak_frames",
+								DuplicateVoiceSuppressor::DEFAULT_REQUIRED_WEAK_FRAMES);
+	ssvrDuplicateVoiceSuppressionReleaseFrames =
+		typeCheckedFromSettings("ssvr_duplicate_voice_suppression_release_frames",
+								DuplicateVoiceSuppressor::DEFAULT_REQUIRED_RELEASE_FRAMES);
+	ssvrDuplicateVoiceSuppressionVerdictCacheMs =
+		typeCheckedFromSettings("ssvr_duplicate_voice_suppression_verdict_cache_ms",
+								static_cast< int >(DuplicateAudioCorrelator::DEFAULT_VERDICT_CACHE_MS));
 
 	bool bObfuscate = typeCheckedFromSettings("obfuscate", false);
 	if (bObfuscate) {
@@ -443,6 +466,16 @@ void MetaParams::read(QString fname) {
 					ssvrDuplicateVoiceSuppression ? QLatin1String("true") : QLatin1String("false"));
 	qmConfig.insert(QLatin1String("ssvr_duplicate_voice_suppression_acoustic"),
 					ssvrDuplicateVoiceSuppressionAcoustic ? QLatin1String("true") : QLatin1String("false"));
+	qmConfig.insert(QLatin1String("ssvr_duplicate_voice_suppression_correlation_threshold"),
+					QString::number(ssvrDuplicateVoiceSuppressionCorrelationThreshold));
+	qmConfig.insert(QLatin1String("ssvr_duplicate_voice_suppression_overlap_window_ms"),
+					QString::number(ssvrDuplicateVoiceSuppressionOverlapWindowMs));
+	qmConfig.insert(QLatin1String("ssvr_duplicate_voice_suppression_weak_frames"),
+					QString::number(ssvrDuplicateVoiceSuppressionWeakFrames));
+	qmConfig.insert(QLatin1String("ssvr_duplicate_voice_suppression_release_frames"),
+					QString::number(ssvrDuplicateVoiceSuppressionReleaseFrames));
+	qmConfig.insert(QLatin1String("ssvr_duplicate_voice_suppression_verdict_cache_ms"),
+					QString::number(ssvrDuplicateVoiceSuppressionVerdictCacheMs));
 	qmConfig.insert(QLatin1String("channelnestinglimit"), QString::number(iChannelNestingLimit));
 	qmConfig.insert(QLatin1String("channelcountlimit"), QString::number(iChannelCountLimit));
 	qmConfig.insert(QLatin1String("sslCiphers"), qsCiphers);

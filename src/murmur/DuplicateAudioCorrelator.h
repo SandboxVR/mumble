@@ -46,7 +46,16 @@ public:
 	// Initial threshold; starting point pending real-audio tuning (see
 	// docs/dev/DuplicateVoiceSuppressionPlan.md open questions). Declared here, not buried
 	// in the .cpp, so follow-up tuning work can find and change it without touching logic.
-	static constexpr double CORRELATION_THRESHOLD = 0.65;
+	static constexpr double DEFAULT_CORRELATION_THRESHOLD = 0.65;
+	static constexpr std::int64_t DEFAULT_VERDICT_CACHE_MS = 150;
+
+	struct Config {
+		double correlationThreshold = DEFAULT_CORRELATION_THRESHOLD;
+		std::int64_t verdictCacheMilliseconds = DEFAULT_VERDICT_CACHE_MS;
+	};
+
+	void setConfig(const Config &config);
+	Config config() const;
 
 private:
 	// Mono float PCM samples at 48kHz, rolling ring buffer of recently decoded audio.
@@ -86,12 +95,12 @@ private:
 	// Phase 1's OVERLAP_WINDOW_MS (120ms) plus the suppressor's 250ms capture window.
 	static constexpr std::int64_t MAX_HISTORY_AGE_MS = 250;
 	static constexpr std::int64_t MAX_SUBMISSION_GAP_MS = 80;
-	static constexpr std::int64_t VERDICT_CACHE_MS = 150;
 
 	mutable std::mutex m_mutex; // guards m_history, m_cachedVerdicts, and m_lastCorrelationScore
 	std::unordered_map< std::uint32_t, DecodedAudioHistory > m_history;
 	std::unordered_map< std::uint64_t, CachedVerdict > m_cachedVerdicts;
 	double m_lastCorrelationScore = -1.0;
+	Config m_config;
 
 	static std::uint64_t pairKey(std::uint32_t sessionA, std::uint32_t sessionB);
 	static std::vector< float > linearize(const DecodedAudioHistory &history);
