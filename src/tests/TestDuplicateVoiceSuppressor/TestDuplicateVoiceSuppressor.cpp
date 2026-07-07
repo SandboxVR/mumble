@@ -258,6 +258,47 @@ private slots:
 		QCOMPARE(oracle.submitCount, submitCountInsideWindow);
 	}
 
+	void test_vbrJitteredNearTieReachesAcousticCandidate() {
+		DuplicateVoiceSuppressor suppressor;
+		FakeAcousticOracle oracle;
+		oracle.shouldConfirm = false;
+		suppressor.setAcousticOracle(&oracle);
+		suppressor.setAcousticConfirmationEnabled(true);
+
+		const std::size_t sessionOnePayloads[] = { 118, 94, 116, 96, 112, 98, 114, 95 };
+		const std::size_t sessionTwoPayloads[] = { 96, 118, 94, 116, 98, 112, 95, 114 };
+
+		bool reachedCandidate = false;
+		for (std::uint64_t frame = 0; frame < 8; ++frame) {
+			DuplicateVoiceSuppressor::Result first = suppressor.shouldForwardVoicePacket(
+				packet(1, 7, static_cast< std::int64_t >(frame * 20), frame, sessionOnePayloads[frame]));
+			DuplicateVoiceSuppressor::Result second = suppressor.shouldForwardVoicePacket(
+				packet(2, 7, static_cast< std::int64_t >(frame * 20 + 10), frame, sessionTwoPayloads[frame]));
+
+			reachedCandidate = reachedCandidate || (first.hasDetails && first.details.metadataGateTriggered)
+							   || (second.hasDetails && second.details.metadataGateTriggered);
+			if (reachedCandidate) {
+				break;
+			}
+		}
+
+		QVERIFY(reachedCandidate);
+		QVERIFY(oracle.isLikelySameSourceCallCount > 0);
+	}
+
+	void test_nearTieRequiresAcousticConfirmation() {
+		DuplicateVoiceSuppressor suppressor;
+
+		for (std::uint64_t frame = 0; frame < 8; ++frame) {
+			QCOMPARE(static_cast< int >(
+						 suppressor.shouldForwardVoicePacket(packet(1, 7, frame * 20, frame, 100)).decision),
+					 static_cast< int >(Decision::NoDecision));
+			QCOMPARE(static_cast< int >(
+						 suppressor.shouldForwardVoicePacket(packet(2, 7, frame * 20 + 10, frame, 103)).decision),
+					 static_cast< int >(Decision::NoDecision));
+		}
+	}
+
 	void test_forgetSessionClearsSuppressionStateForSessionReuse() {
 		DuplicateVoiceSuppressor suppressor;
 
