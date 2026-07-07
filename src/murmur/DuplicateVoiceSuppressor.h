@@ -102,6 +102,7 @@ private:
 	};
 
 	static constexpr std::int64_t OVERLAP_WINDOW_MS = 120;
+	static constexpr std::int64_t ACOUSTIC_CAPTURE_WINDOW_MS = 250;
 	static constexpr unsigned int REQUIRED_WEAK_FRAMES = 3;
 	static constexpr unsigned int REQUIRED_RELEASE_FRAMES = 2;
 	// Gate 1 only needs to flag a *candidate* duplicate pair -- when acoustic confirmation
@@ -119,12 +120,14 @@ private:
 
 	std::unordered_map< unsigned int, std::unordered_map< std::uint32_t, Activity > > m_activityByChannel;
 	std::unordered_map< std::uint32_t, SessionState > m_sessionStates;
+	std::unordered_map< std::uint32_t, std::int64_t > m_acousticCaptureUntilBySession;
 
 	std::mutex m_mutex;
 	IAcousticOracle *m_acousticOracle          = nullptr;
 	bool m_acousticConfirmationEnabled = false;
 
 	void pruneChannel(unsigned int channelID, std::int64_t nowMilliseconds);
+	void pruneAcousticCaptureWindows(std::int64_t nowMilliseconds);
 	void updateActivity(const PacketMetadata &metadata, double score, unsigned int continuityFrames);
 	void removeActivity(const PacketMetadata &metadata);
 	double scorePacket(const PacketMetadata &metadata, const Activity *previousActivity,

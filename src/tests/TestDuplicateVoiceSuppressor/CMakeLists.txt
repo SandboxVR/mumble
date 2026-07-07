@@ -5,6 +5,8 @@
 
 add_executable(TestDuplicateVoiceSuppressor TestDuplicateVoiceSuppressor.cpp)
 
+find_package(Threads REQUIRED)
+
 set_target_properties(TestDuplicateVoiceSuppressor PROPERTIES AUTOMOC ON)
 
 target_sources(TestDuplicateVoiceSuppressor PRIVATE
@@ -15,6 +17,6 @@ target_include_directories(TestDuplicateVoiceSuppressor PRIVATE
 	"${CMAKE_SOURCE_DIR}/src/murmur"
 )
 
-target_link_libraries(TestDuplicateVoiceSuppressor PRIVATE shared Qt5::Test)
+target_link_libraries(TestDuplicateVoiceSuppressor PRIVATE shared Qt5::Test Threads::Threads)
 
 add_test(NAME TestDuplicateVoiceSuppressor COMMAND $<TARGET_FILE:TestDuplicateVoiceSuppressor>)

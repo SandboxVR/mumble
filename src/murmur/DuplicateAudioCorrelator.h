@@ -46,7 +46,7 @@ public:
 	// Initial threshold; starting point pending real-audio tuning (see
 	// docs/dev/DuplicateVoiceSuppressionPlan.md open questions). Declared here, not buried
 	// in the .cpp, so follow-up tuning work can find and change it without touching logic.
-	static constexpr double CORRELATION_THRESHOLD = 0.75;
+	static constexpr double CORRELATION_THRESHOLD = 0.65;
 
 private:
 	// Mono float PCM samples at 48kHz, rolling ring buffer of recently decoded audio.
@@ -58,27 +58,48 @@ private:
 		std::int64_t lastPacketTimestampMilliseconds = 0;
 	};
 
+	struct HistorySnapshot {
+		std::vector< float > samples;
+		std::int64_t lastPacketTimestampMilliseconds = 0;
+	};
+
+	struct CachedVerdict {
+		std::int64_t timestampMilliseconds = 0;
+		double score = -1.0;
+		bool confirmed = false;
+	};
+
 	static constexpr int SAMPLE_RATE_HZ            = 48000;
 	static constexpr int MAX_SAMPLES_PER_PACKET    = SAMPLE_RATE_HZ * 60 / 1000; // 60ms max Opus frame, mono
-	// How much decoded history we keep per session to correlate against: 100ms @ 48kHz mono.
-	// Large enough to cover several packets (typically 10-20ms each) and the lag search
-	// window below, small enough to keep memory + correlation cost per pair trivially cheap.
-	static constexpr std::size_t HISTORY_CAPACITY_SAMPLES = SAMPLE_RATE_HZ / 10; // 4800 samples = 100ms
-	// Lag search window: mic-distance + network jitter is expected to put the true peak
-	// within a few ms; search a bit wider to be safe. +/- 15ms @ 48kHz.
-	static constexpr int MAX_LAG_SAMPLES = SAMPLE_RATE_HZ * 15 / 1000; // 720 samples
+	static constexpr int ENVELOPE_HOP_MS          = 5;
+	static constexpr std::size_t ENVELOPE_HOP_SAMPLES = SAMPLE_RATE_HZ * ENVELOPE_HOP_MS / 1000; // 240 samples
+	// Keep enough decoded history for a >=200ms envelope overlap plus residual lag search.
+	static constexpr std::size_t HISTORY_CAPACITY_SAMPLES = SAMPLE_RATE_HZ * 300 / 1000; // 300ms
+	static constexpr int MAX_RESIDUAL_LAG_ENVELOPE_HOPS = 20 / ENVELOPE_HOP_MS; // +/-20ms
 	// Minimum overlapping history (post-lag-alignment) required before we trust a
 	// correlation result at all; below this we return "not confirmed" (fail open) rather
 	// than a spurious high/low score from too little data.
-	static constexpr std::size_t MIN_SAMPLES_FOR_CORRELATION = SAMPLE_RATE_HZ * 20 / 1000; // 20ms
+	static constexpr std::size_t MIN_SAMPLES_FOR_CORRELATION = SAMPLE_RATE_HZ * 200 / 1000; // 200ms
+	static constexpr int MIN_ENVELOPE_FRAMES_FOR_CORRELATION =
+		static_cast< int >(MIN_SAMPLES_FOR_CORRELATION / ENVELOPE_HOP_SAMPLES);
 	// History older than this is not "current" enough to trust; comfortably larger than
-	// Phase 1's OVERLAP_WINDOW_MS (120ms) plus this class's own history depth (100ms).
+	// Phase 1's OVERLAP_WINDOW_MS (120ms) plus the suppressor's 250ms capture window.
 	static constexpr std::int64_t MAX_HISTORY_AGE_MS = 250;
+	static constexpr std::int64_t MAX_SUBMISSION_GAP_MS = 80;
+	static constexpr std::int64_t VERDICT_CACHE_MS = 150;
 
-	mutable std::mutex m_mutex; // guards m_history and m_lastCorrelationScore
+	mutable std::mutex m_mutex; // guards m_history, m_cachedVerdicts, and m_lastCorrelationScore
 	std::unordered_map< std::uint32_t, DecodedAudioHistory > m_history;
+	std::unordered_map< std::uint64_t, CachedVerdict > m_cachedVerdicts;
 	double m_lastCorrelationScore = -1.0;
 
+	static std::uint64_t pairKey(std::uint32_t sessionA, std::uint32_t sessionB);
+	static std::vector< float > linearize(const DecodedAudioHistory &history);
+	static std::vector< double > logEnergyEnvelope(const std::vector< float > &samples);
+	static double normalizedEnvelopeCorrelationPeak(const std::vector< double > &a,
+													const std::vector< double > &b,
+													int expectedLagEnvelopeHops,
+													int maxResidualLagEnvelopeHops);
 	static double normalizedCrossCorrelationPeak(const std::vector< float > &a, const std::vector< float > &b,
 												  int maxLagSamples);
 };

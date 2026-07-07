@@ -5,6 +5,10 @@
 
 #include "DuplicateVoiceSuppressor.h"
 
+#include <atomic>
+#include <thread>
+#include <vector>
+
 #include <QObject>
 #include <QtTest>
 
@@ -15,18 +19,23 @@ public:
 	bool shouldConfirm               = true;
 	int submitCount                  = 0;
 	int isLikelySameSourceCallCount = 0;
+	std::vector< std::uint32_t > submittedSessions;
 
 	bool isLikelySameSource(std::uint32_t, std::uint32_t, std::int64_t) override {
 		++isLikelySameSourceCallCount;
 		return shouldConfirm;
 	}
 	void submitPacket(std::uint32_t, Mumble::Protocol::AudioCodec, const unsigned char *, std::size_t,
-					   std::int64_t) override {
-		++submitCount;
-	}
+					   std::int64_t) override;
 	void forgetSession(std::uint32_t) override {}
 	double lastCorrelationScore() const override { return shouldConfirm ? 1.0 : 0.0; }
 };
+
+void FakeAcousticOracle::submitPacket(std::uint32_t sessionID, Mumble::Protocol::AudioCodec,
+									   const unsigned char *, std::size_t, std::int64_t) {
+	++submitCount;
+	submittedSessions.push_back(sessionID);
+}
 
 class TestDuplicateVoiceSuppressor : public QObject {
 	Q_OBJECT
@@ -39,9 +48,9 @@ private:
 		return data;
 	}
 
-	DuplicateVoiceSuppressor::PacketMetadata packet(std::uint32_t sessionID, unsigned int channelID,
-													std::int64_t timestampMilliseconds, std::uint64_t frameNumber,
-													std::size_t payloadSize) const {
+	static DuplicateVoiceSuppressor::PacketMetadata packet(std::uint32_t sessionID, unsigned int channelID,
+														   std::int64_t timestampMilliseconds, std::uint64_t frameNumber,
+														   std::size_t payloadSize) {
 		DuplicateVoiceSuppressor::PacketMetadata metadata;
 		metadata.sessionID             = sessionID;
 		metadata.channelID              = channelID;
@@ -228,6 +237,69 @@ private slots:
 
 		QVERIFY(oracle.submitCount > 0);
 		QCOMPARE(oracle.isLikelySameSourceCallCount, 1);
+	}
+
+	void test_acousticCaptureContinuesBrieflyAfterOverlap() {
+		DuplicateVoiceSuppressor suppressor;
+		FakeAcousticOracle oracle;
+		suppressor.setAcousticOracle(&oracle);
+		suppressor.setAcousticConfirmationEnabled(true);
+
+		suppressor.shouldForwardVoicePacket(packet(1, 7, 0, 0, 100));
+		suppressor.shouldForwardVoicePacket(packet(2, 7, 10, 0, 35));
+		const int submitCountAfterOverlap = oracle.submitCount;
+
+		suppressor.shouldForwardVoicePacket(packet(1, 7, 200, 1, 100));
+		QVERIFY(oracle.submitCount > submitCountAfterOverlap);
+		QCOMPARE(oracle.submittedSessions.back(), static_cast< std::uint32_t >(1));
+
+		const int submitCountInsideWindow = oracle.submitCount;
+		suppressor.shouldForwardVoicePacket(packet(1, 7, 300, 2, 100));
+		QCOMPARE(oracle.submitCount, submitCountInsideWindow);
+	}
+
+	void test_forgetSessionClearsSuppressionStateForSessionReuse() {
+		DuplicateVoiceSuppressor suppressor;
+
+		suppressor.shouldForwardVoicePacket(packet(1, 7, 0, 0, 100));
+		suppressor.shouldForwardVoicePacket(packet(2, 7, 10, 0, 35));
+		suppressor.shouldForwardVoicePacket(packet(1, 7, 20, 1, 102));
+		suppressor.shouldForwardVoicePacket(packet(2, 7, 30, 1, 34));
+		suppressor.shouldForwardVoicePacket(packet(1, 7, 40, 2, 101));
+
+		DuplicateVoiceSuppressor::Result suppressed = suppressor.shouldForwardVoicePacket(packet(2, 7, 50, 2, 36));
+		QCOMPARE(static_cast< int >(suppressed.decision), static_cast< int >(Decision::Suppress));
+
+		suppressor.forgetSession(2);
+
+		DuplicateVoiceSuppressor::Result reused = suppressor.shouldForwardVoicePacket(packet(2, 7, 60, 0, 36));
+		QCOMPARE(static_cast< int >(reused.decision), static_cast< int >(Decision::NoDecision));
+	}
+
+	void test_threadedSmokeDoesNotCorruptSuppressorState() {
+		DuplicateVoiceSuppressor suppressor;
+		std::atomic< bool > start(false);
+
+		auto hammer = [&suppressor, &start](std::uint32_t sessionID, std::size_t payloadSize,
+											std::int64_t timestampOffset) {
+			while (!start.load(std::memory_order_acquire)) {
+				std::this_thread::yield();
+			}
+
+			for (std::uint64_t frame = 0; frame < 2000; ++frame) {
+				suppressor.shouldForwardVoicePacket(
+					packet(sessionID, 7, static_cast< std::int64_t >(frame * 20) + timestampOffset, frame, payloadSize));
+			}
+		};
+
+		std::thread first(hammer, 1, 100, 0);
+		std::thread second(hammer, 2, 35, 10);
+
+		start.store(true, std::memory_order_release);
+		first.join();
+		second.join();
+
+		QVERIFY(true);
 	}
 };
 

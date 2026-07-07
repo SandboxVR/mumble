@@ -18,25 +18,39 @@
 namespace {
 constexpr int SAMPLE_RATE_HZ  = 48000;
 constexpr std::size_t FRAME_SAMPLES = 960; // 20ms @ 48kHz mono
+constexpr std::size_t TEN_MS_FRAME_SAMPLES = 480;
 
-std::vector< float > generateTone(std::size_t sampleCount, double freqHzA, double freqHzB) {
+std::vector< float > generateSpeechShapedNoise(std::size_t sampleCount, unsigned int seed) {
+	std::mt19937 rng(seed);
+	std::uniform_real_distribution< float > dist(-1.0f, 1.0f);
+	std::uniform_real_distribution< double > phaseDist(0.0, 2.0 * M_PI);
+	const double phaseA = phaseDist(rng);
+	const double phaseB = phaseDist(rng);
+
 	std::vector< float > samples(sampleCount);
+	float filtered = 0.0f;
 	for (std::size_t i = 0; i < sampleCount; ++i) {
-		double t  = static_cast< double >(i) / SAMPLE_RATE_HZ;
-		samples[i] = static_cast< float >(0.3 * std::sin(2.0 * M_PI * freqHzA * t)
-										   + 0.3 * std::sin(2.0 * M_PI * freqHzB * t));
+		const double t = static_cast< double >(i) / SAMPLE_RATE_HZ;
+		const double syllable =
+			0.35 + 0.35 * std::sin(2.0 * M_PI * 3.1 * t + phaseA)
+			+ 0.20 * std::sin(2.0 * M_PI * 6.7 * t + phaseB);
+		const double envelope = std::max(0.04, syllable);
+
+		filtered = 0.96f * filtered + 0.04f * dist(rng);
+		samples[i] = static_cast< float >(0.6 * envelope * filtered);
 	}
 	return samples;
 }
 
-std::vector< float > generateNoise(std::size_t sampleCount, unsigned int seed) {
-	std::mt19937 rng(seed);
-	std::uniform_real_distribution< float > dist(-0.3f, 0.3f);
-	std::vector< float > samples(sampleCount);
-	for (std::size_t i = 0; i < sampleCount; ++i) {
-		samples[i] = dist(rng);
+std::vector< float > applyStaticGainAndGate(const std::vector< float > &samples) {
+	std::vector< float > out(samples.size());
+	for (std::size_t i = 0; i < samples.size(); ++i) {
+		const double t = static_cast< double >(i) / SAMPLE_RATE_HZ;
+		const bool gateOpen = std::sin(2.0 * M_PI * 3.1 * t + 0.35) > -0.45;
+		const double gain = gateOpen ? 0.42 : 0.06;
+		out[i] = static_cast< float >(samples[i] * gain);
 	}
-	return samples;
+	return out;
 }
 } // namespace
 
@@ -44,12 +58,13 @@ class TestDuplicateAudioCorrelator : public QObject {
 	Q_OBJECT
 
 private:
-	// Encodes pcm as a sequence of 20ms Opus frames and feeds them into the correlator for
-	// the given session, starting at startTimestampMs and advancing 20ms per frame. Writes
+	// Encodes pcm as a sequence of Opus frames and feeds them into the correlator for
+	// the given session, starting at startTimestampMs and advancing by frame duration. Writes
 	// the timestamp of the last submitted frame to outLastTimestampMs. QFAIL expands to a
 	// bare `return;`, so this must be void (an out-parameter), not return a value.
 	void feedFrames(DuplicateAudioCorrelator &correlator, std::uint32_t sessionID, const std::vector< float > &pcm,
-					std::int64_t startTimestampMs, std::int64_t &outLastTimestampMs) {
+					std::int64_t startTimestampMs, std::int64_t &outLastTimestampMs,
+					std::size_t frameSamples = FRAME_SAMPLES) {
 		outLastTimestampMs = startTimestampMs;
 
 		int err              = 0;
@@ -59,10 +74,12 @@ private:
 		}
 
 		unsigned char encoded[4000];
-		std::int64_t timestamp = startTimestampMs;
+		const std::int64_t timestampStepMs =
+			static_cast< std::int64_t >(frameSamples * 1000 / SAMPLE_RATE_HZ);
+		std::int64_t timestamp = startTimestampMs + timestampStepMs;
 
-		for (std::size_t offset = 0; offset + FRAME_SAMPLES <= pcm.size(); offset += FRAME_SAMPLES) {
-			int encodedBytes = opus_encode_float(encoder, pcm.data() + offset, static_cast< int >(FRAME_SAMPLES),
+		for (std::size_t offset = 0; offset + frameSamples <= pcm.size(); offset += frameSamples) {
+			int encodedBytes = opus_encode_float(encoder, pcm.data() + offset, static_cast< int >(frameSamples),
 												  encoded, sizeof(encoded));
 			if (encodedBytes <= 0) {
 				opus_encoder_destroy(encoder);
@@ -72,7 +89,7 @@ private:
 			correlator.submitPacket(sessionID, Mumble::Protocol::AudioCodec::Opus, encoded,
 									 static_cast< std::size_t >(encodedBytes), timestamp);
 			outLastTimestampMs = timestamp;
-			timestamp += 20;
+			timestamp += timestampStepMs;
 		}
 
 		opus_encoder_destroy(encoder);
@@ -85,7 +102,7 @@ private slots:
 		const std::size_t lagSamples   = 240; // 5ms -- plausible mic-distance/jitter offset
 		const std::size_t totalSamples = 19200; // 400ms, exact multiple of FRAME_SAMPLES
 
-		std::vector< float > fullSignal = generateTone(totalSamples + lagSamples, 220.0, 440.0);
+		std::vector< float > fullSignal = generateSpeechShapedNoise(totalSamples + lagSamples, 7);
 		std::vector< float > signalA(fullSignal.begin(), fullSignal.begin() + totalSamples);
 		std::vector< float > signalB(fullSignal.begin() + lagSamples, fullSignal.begin() + lagSamples + totalSamples);
 
@@ -103,8 +120,8 @@ private slots:
 
 		const std::size_t totalSamples = 19200; // 400ms
 
-		std::vector< float > signalA = generateTone(totalSamples, 220.0, 440.0);
-		std::vector< float > signalB = generateNoise(totalSamples, 12345);
+		std::vector< float > signalA = generateSpeechShapedNoise(totalSamples, 11);
+		std::vector< float > signalB = generateSpeechShapedNoise(totalSamples, 12345);
 
 		std::int64_t tsA = 0, tsB = 0;
 		feedFrames(correlator, 1, signalA, 0, tsA);
@@ -113,6 +130,75 @@ private slots:
 		std::int64_t now = std::max(tsA, tsB);
 		QVERIFY(!correlator.isLikelySameSource(1, 2, now));
 		QVERIFY(correlator.lastCorrelationScore() < DuplicateAudioCorrelator::CORRELATION_THRESHOLD);
+	}
+
+	void test_unequalHistoryLengthsAreEndAligned() {
+		DuplicateAudioCorrelator correlator;
+
+		const std::size_t totalSamples = 19200; // 400ms
+		const std::size_t shorterSamples = 12480; // 260ms
+		std::vector< float > signal = generateSpeechShapedNoise(totalSamples, 21);
+		std::vector< float > signalTail(signal.end() - shorterSamples, signal.end());
+
+		std::int64_t tsA = 0, tsB = 0;
+		feedFrames(correlator, 1, signal, 0, tsA);
+		feedFrames(correlator, 2, signalTail, 140, tsB);
+
+		std::int64_t now = std::max(tsA, tsB);
+		QVERIFY(correlator.isLikelySameSource(1, 2, now));
+		QVERIFY(correlator.lastCorrelationScore() >= DuplicateAudioCorrelator::CORRELATION_THRESHOLD);
+	}
+
+	void test_arrivalTimeSkewBeyondOldWaveformLagIsConfirmed() {
+		DuplicateAudioCorrelator correlator;
+
+		const std::size_t totalSamples = 19200; // 400ms
+		const std::size_t skewSamples = SAMPLE_RATE_HZ * 40 / 1000;
+		std::vector< float > fullSignal = generateSpeechShapedNoise(totalSamples + skewSamples, 31);
+		std::vector< float > signalA(fullSignal.begin(), fullSignal.begin() + totalSamples);
+		std::vector< float > signalB(fullSignal.begin() + skewSamples, fullSignal.begin() + skewSamples + totalSamples);
+
+		std::int64_t tsA = 0, tsB = 0;
+		feedFrames(correlator, 1, signalA, 0, tsA);
+		feedFrames(correlator, 2, signalB, 40, tsB);
+
+		std::int64_t now = std::max(tsA, tsB);
+		QVERIFY(correlator.isLikelySameSource(1, 2, now));
+		QVERIFY(correlator.lastCorrelationScore() >= DuplicateAudioCorrelator::CORRELATION_THRESHOLD);
+	}
+
+	void test_staticGainAndTimeVaryingGateStillConfirm() {
+		DuplicateAudioCorrelator correlator;
+
+		const std::size_t totalSamples = 19200; // 400ms
+		const std::size_t skewSamples = SAMPLE_RATE_HZ * 20 / 1000;
+		std::vector< float > fullSignal = generateSpeechShapedNoise(totalSamples + skewSamples, 41);
+		std::vector< float > signalA(fullSignal.begin(), fullSignal.begin() + totalSamples);
+		std::vector< float > signalB(fullSignal.begin() + skewSamples, fullSignal.begin() + skewSamples + totalSamples);
+		signalB = applyStaticGainAndGate(signalB);
+
+		std::int64_t tsA = 0, tsB = 0;
+		feedFrames(correlator, 1, signalA, 0, tsA);
+		feedFrames(correlator, 2, signalB, 20, tsB);
+
+		std::int64_t now = std::max(tsA, tsB);
+		QVERIFY(correlator.isLikelySameSource(1, 2, now));
+		QVERIFY(correlator.lastCorrelationScore() >= DuplicateAudioCorrelator::CORRELATION_THRESHOLD);
+	}
+
+	void test_differentFrameSizesStillConfirm() {
+		DuplicateAudioCorrelator correlator;
+
+		const std::size_t totalSamples = 19200; // 400ms
+		std::vector< float > signal = generateSpeechShapedNoise(totalSamples, 51);
+
+		std::int64_t tsA = 0, tsB = 0;
+		feedFrames(correlator, 1, signal, 0, tsA, FRAME_SAMPLES);
+		feedFrames(correlator, 2, signal, 0, tsB, TEN_MS_FRAME_SAMPLES);
+
+		std::int64_t now = std::max(tsA, tsB);
+		QVERIFY(correlator.isLikelySameSource(1, 2, now));
+		QVERIFY(correlator.lastCorrelationScore() >= DuplicateAudioCorrelator::CORRELATION_THRESHOLD);
 	}
 
 	void test_notEnoughDataFailsOpen() {
@@ -124,7 +210,7 @@ private slots:
 		DuplicateAudioCorrelator correlator;
 
 		const std::size_t totalSamples = 19200;
-		std::vector< float > signal    = generateTone(totalSamples, 220.0, 440.0);
+		std::vector< float > signal    = generateSpeechShapedNoise(totalSamples, 61);
 
 		std::int64_t tsA = 0, tsB = 0;
 		feedFrames(correlator, 1, signal, 0, tsA);
@@ -141,7 +227,7 @@ private slots:
 		DuplicateAudioCorrelator correlator;
 
 		const std::size_t totalSamples = 19200;
-		std::vector< float > signal    = generateTone(totalSamples, 220.0, 440.0);
+		std::vector< float > signal    = generateSpeechShapedNoise(totalSamples, 71);
 
 		std::int64_t tsA = 0, tsB = 0;
 		feedFrames(correlator, 1, signal, 0, tsA);

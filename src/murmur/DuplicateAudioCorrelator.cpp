@@ -49,6 +49,14 @@ void DuplicateAudioCorrelator::submitPacket(std::uint32_t sessionID, Mumble::Pro
 		history.validSamples = 0;
 	}
 
+	if (history.validSamples > 0
+		&& (timestampMilliseconds < history.lastPacketTimestampMilliseconds
+			|| timestampMilliseconds - history.lastPacketTimestampMilliseconds > MAX_SUBMISSION_GAP_MS)) {
+		opus_decoder_ctl(history.decoder, OPUS_RESET_STATE);
+		history.writeIndex   = 0;
+		history.validSamples = 0;
+	}
+
 	float decodeScratch[MAX_SAMPLES_PER_PACKET];
 	int decodedSamples = opus_decode_float(history.decoder, payload, static_cast< int >(payloadSize),
 											decodeScratch, MAX_SAMPLES_PER_PACKET, 0);
@@ -69,44 +77,76 @@ void DuplicateAudioCorrelator::submitPacket(std::uint32_t sessionID, Mumble::Pro
 
 bool DuplicateAudioCorrelator::isLikelySameSource(std::uint32_t sessionA, std::uint32_t sessionB,
 												   std::int64_t nowMilliseconds) {
-	std::lock_guard< std::mutex > lock(m_mutex);
-	m_lastCorrelationScore = -1.0;
+	HistorySnapshot snapshotA;
+	HistorySnapshot snapshotB;
 
-	auto itA = m_history.find(sessionA);
-	auto itB = m_history.find(sessionB);
-	if (itA == m_history.end() || itB == m_history.end()) {
-		return false; // fail open: not enough data to confirm -> caller should not veto Phase 1
-	}
+	const std::uint64_t cacheKey = pairKey(sessionA, sessionB);
 
-	const DecodedAudioHistory &a = itA->second;
-	const DecodedAudioHistory &b = itB->second;
+	{
+		std::lock_guard< std::mutex > lock(m_mutex);
+		m_lastCorrelationScore = -1.0;
 
-	if (nowMilliseconds - a.lastPacketTimestampMilliseconds > MAX_HISTORY_AGE_MS
-		|| nowMilliseconds - b.lastPacketTimestampMilliseconds > MAX_HISTORY_AGE_MS) {
-		return false;
-	}
-
-	if (a.validSamples < MIN_SAMPLES_FOR_CORRELATION || b.validSamples < MIN_SAMPLES_FOR_CORRELATION) {
-		return false;
-	}
-
-	// Linearize ring buffers into contiguous vectors covering the valid tail.
-	auto linearize = [](const DecodedAudioHistory &history) {
-		std::vector< float > out(history.validSamples);
-		std::size_t start =
-			(history.writeIndex + HISTORY_CAPACITY_SAMPLES - history.validSamples) % HISTORY_CAPACITY_SAMPLES;
-		for (std::size_t i = 0; i < history.validSamples; ++i) {
-			out[i] = history.ringBuffer[(start + i) % HISTORY_CAPACITY_SAMPLES];
+		auto cacheIt = m_cachedVerdicts.find(cacheKey);
+		if (cacheIt != m_cachedVerdicts.end()
+			&& nowMilliseconds - cacheIt->second.timestampMilliseconds <= VERDICT_CACHE_MS) {
+			m_lastCorrelationScore = cacheIt->second.score;
+			return cacheIt->second.confirmed;
 		}
-		return out;
-	};
 
-	std::vector< float > samplesA = linearize(a);
-	std::vector< float > samplesB = linearize(b);
+		auto itA = m_history.find(sessionA);
+		auto itB = m_history.find(sessionB);
+		if (itA == m_history.end() || itB == m_history.end()) {
+			return false;
+		}
 
-	double score            = normalizedCrossCorrelationPeak(samplesA, samplesB, MAX_LAG_SAMPLES);
-	m_lastCorrelationScore  = score;
-	return score >= CORRELATION_THRESHOLD;
+		const DecodedAudioHistory &a = itA->second;
+		const DecodedAudioHistory &b = itB->second;
+
+		if (nowMilliseconds - a.lastPacketTimestampMilliseconds > MAX_HISTORY_AGE_MS
+			|| nowMilliseconds - b.lastPacketTimestampMilliseconds > MAX_HISTORY_AGE_MS) {
+			return false;
+		}
+
+		if (a.validSamples < MIN_SAMPLES_FOR_CORRELATION || b.validSamples < MIN_SAMPLES_FOR_CORRELATION) {
+			return false;
+		}
+
+		snapshotA.samples = linearize(a);
+		snapshotA.lastPacketTimestampMilliseconds = a.lastPacketTimestampMilliseconds;
+		snapshotB.samples = linearize(b);
+		snapshotB.lastPacketTimestampMilliseconds = b.lastPacketTimestampMilliseconds;
+	}
+
+	std::vector< double > envelopeA = logEnergyEnvelope(snapshotA.samples);
+	std::vector< double > envelopeB = logEnergyEnvelope(snapshotB.samples);
+
+	if (envelopeA.size() < static_cast< std::size_t >(MIN_ENVELOPE_FRAMES_FOR_CORRELATION)
+		|| envelopeB.size() < static_cast< std::size_t >(MIN_ENVELOPE_FRAMES_FOR_CORRELATION)) {
+		return false;
+	}
+
+	const std::int64_t startA = snapshotA.lastPacketTimestampMilliseconds
+								- static_cast< std::int64_t >((envelopeA.size() - 1) * ENVELOPE_HOP_MS);
+	const std::int64_t startB = snapshotB.lastPacketTimestampMilliseconds
+								- static_cast< std::int64_t >((envelopeB.size() - 1) * ENVELOPE_HOP_MS);
+	const int expectedLagEnvelopeHops =
+		static_cast< int >(std::llround(static_cast< double >(startA - startB) / ENVELOPE_HOP_MS));
+
+	const double score = normalizedEnvelopeCorrelationPeak(envelopeA, envelopeB, expectedLagEnvelopeHops,
+														   MAX_RESIDUAL_LAG_ENVELOPE_HOPS);
+	const bool confirmed = score >= CORRELATION_THRESHOLD;
+
+	{
+		std::lock_guard< std::mutex > lock(m_mutex);
+		m_lastCorrelationScore = score;
+		CachedVerdict verdict;
+		verdict.timestampMilliseconds = nowMilliseconds;
+		verdict.score = score;
+		verdict.confirmed = confirmed;
+		m_cachedVerdicts[cacheKey] = verdict;
+	}
+
+	return confirmed;
 }
 
 void DuplicateAudioCorrelator::forgetSession(std::uint32_t sessionID) {
@@ -118,11 +158,101 @@ void DuplicateAudioCorrelator::forgetSession(std::uint32_t sessionID) {
 		}
 		m_history.erase(it);
 	}
+
+	for (auto cacheIt = m_cachedVerdicts.begin(); cacheIt != m_cachedVerdicts.end();) {
+		const std::uint32_t first = static_cast< std::uint32_t >(cacheIt->first >> 32);
+		const std::uint32_t second = static_cast< std::uint32_t >(cacheIt->first & 0xffffffffu);
+		if (first == sessionID || second == sessionID) {
+			cacheIt = m_cachedVerdicts.erase(cacheIt);
+		} else {
+			++cacheIt;
+		}
+	}
 }
 
 double DuplicateAudioCorrelator::lastCorrelationScore() const {
 	std::lock_guard< std::mutex > lock(m_mutex);
 	return m_lastCorrelationScore;
+}
+
+std::uint64_t DuplicateAudioCorrelator::pairKey(std::uint32_t sessionA, std::uint32_t sessionB) {
+	const std::uint32_t first = std::min(sessionA, sessionB);
+	const std::uint32_t second = std::max(sessionA, sessionB);
+	return (static_cast< std::uint64_t >(first) << 32) | second;
+}
+
+std::vector< float > DuplicateAudioCorrelator::linearize(const DecodedAudioHistory &history) {
+	std::vector< float > out(history.validSamples);
+	std::size_t start =
+		(history.writeIndex + HISTORY_CAPACITY_SAMPLES - history.validSamples) % HISTORY_CAPACITY_SAMPLES;
+	for (std::size_t i = 0; i < history.validSamples; ++i) {
+		out[i] = history.ringBuffer[(start + i) % HISTORY_CAPACITY_SAMPLES];
+	}
+	return out;
+}
+
+std::vector< double > DuplicateAudioCorrelator::logEnergyEnvelope(const std::vector< float > &samples) {
+	const std::size_t frameCount = samples.size() / ENVELOPE_HOP_SAMPLES;
+	std::vector< double > envelope(frameCount);
+
+	for (std::size_t frame = 0; frame < frameCount; ++frame) {
+		double sumSquares = 0.0;
+		const std::size_t start = frame * ENVELOPE_HOP_SAMPLES;
+		for (std::size_t i = 0; i < ENVELOPE_HOP_SAMPLES; ++i) {
+			const double sample = samples[start + i];
+			sumSquares += sample * sample;
+		}
+
+		const double meanSquare = sumSquares / static_cast< double >(ENVELOPE_HOP_SAMPLES);
+		envelope[frame] = std::log(std::max(meanSquare, 1e-10));
+	}
+
+	return envelope;
+}
+
+double DuplicateAudioCorrelator::normalizedEnvelopeCorrelationPeak(const std::vector< double > &a,
+																	const std::vector< double > &b,
+																	int expectedLagEnvelopeHops,
+																	int maxResidualLagEnvelopeHops) {
+	double bestScore = 0.0;
+
+	const int lenA = static_cast< int >(a.size());
+	const int lenB = static_cast< int >(b.size());
+
+	for (int lag = expectedLagEnvelopeHops - maxResidualLagEnvelopeHops;
+		 lag <= expectedLagEnvelopeHops + maxResidualLagEnvelopeHops; ++lag) {
+		int start      = std::max(0, -lag);
+		int end        = std::min(lenA, lenB - lag);
+		int overlapLen = end - start;
+		if (overlapLen < MIN_ENVELOPE_FRAMES_FOR_CORRELATION) {
+			continue;
+		}
+
+		double sumA = 0.0, sumB = 0.0, sumAA = 0.0, sumBB = 0.0, sumAB = 0.0;
+		for (int i = start; i < end; ++i) {
+			const double va = a[static_cast< std::size_t >(i)];
+			const double vb = b[static_cast< std::size_t >(i + lag)];
+			sumA += va;
+			sumB += vb;
+			sumAA += va * va;
+			sumBB += vb * vb;
+			sumAB += va * vb;
+		}
+
+		const double n = static_cast< double >(overlapLen);
+		const double covariance = sumAB - (sumA * sumB) / n;
+		const double varA = sumAA - (sumA * sumA) / n;
+		const double varB = sumBB - (sumB * sumB) / n;
+		const double denom = std::sqrt(std::max(varA, 0.0) * std::max(varB, 0.0));
+
+		if (denom < 1e-9) {
+			continue;
+		}
+
+		bestScore = std::max(bestScore, covariance / denom);
+	}
+
+	return bestScore;
 }
 
 double DuplicateAudioCorrelator::normalizedCrossCorrelationPeak(const std::vector< float > &a,

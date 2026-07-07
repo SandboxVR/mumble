@@ -9,7 +9,26 @@
 #include <cmath>
 #include <sstream>
 
+namespace {
+struct AcousticSubmission {
+	IAcousticOracle *oracle = nullptr;
+	std::uint32_t sessionID = 0;
+	Mumble::Protocol::AudioCodec codec = Mumble::Protocol::AudioCodec::Opus;
+	const unsigned char *payloadData = nullptr;
+	std::size_t payloadSize = 0;
+	std::int64_t timestampMilliseconds = 0;
+};
+
+struct AcousticCheck {
+	IAcousticOracle *oracle = nullptr;
+	std::uint32_t keptSession = 0;
+	std::uint32_t suppressedSession = 0;
+	std::int64_t timestampMilliseconds = 0;
+};
+} // namespace
+
 constexpr std::int64_t DuplicateVoiceSuppressor::OVERLAP_WINDOW_MS;
+constexpr std::int64_t DuplicateVoiceSuppressor::ACOUSTIC_CAPTURE_WINDOW_MS;
 constexpr unsigned int DuplicateVoiceSuppressor::REQUIRED_WEAK_FRAMES;
 constexpr unsigned int DuplicateVoiceSuppressor::REQUIRED_RELEASE_FRAMES;
 constexpr double DuplicateVoiceSuppressor::MIN_STRONGER_RATIO;
@@ -19,6 +38,7 @@ void DuplicateVoiceSuppressor::clear() {
 	std::lock_guard< std::mutex > lock(m_mutex);
 	m_activityByChannel.clear();
 	m_sessionStates.clear();
+	m_acousticCaptureUntilBySession.clear();
 }
 
 void DuplicateVoiceSuppressor::forgetSession(std::uint32_t sessionID) {
@@ -34,6 +54,7 @@ void DuplicateVoiceSuppressor::forgetSession(std::uint32_t sessionID) {
 	}
 
 	m_sessionStates.erase(sessionID);
+	m_acousticCaptureUntilBySession.erase(sessionID);
 }
 
 void DuplicateVoiceSuppressor::setAcousticOracle(IAcousticOracle *oracle) {
@@ -47,174 +68,209 @@ void DuplicateVoiceSuppressor::setAcousticConfirmationEnabled(bool enabled) {
 }
 
 DuplicateVoiceSuppressor::Result DuplicateVoiceSuppressor::shouldForwardVoicePacket(const PacketMetadata &metadata) {
-	std::lock_guard< std::mutex > lock(m_mutex);
-
 	Result result;
+	AcousticSubmission acousticSubmission;
+	AcousticCheck acousticCheck;
 
-	if (metadata.isWhisperOrDirect) {
-		return result;
-	}
+	{
+		std::lock_guard< std::mutex > lock(m_mutex);
 
-	if (metadata.isTerminator || metadata.payloadSize == 0) {
-		removeActivity(metadata);
-		return result;
-	}
-
-	pruneChannel(metadata.channelID, metadata.timestampMilliseconds);
-
-	auto &channelActivity = m_activityByChannel[metadata.channelID];
-	const Activity *previousActivity = nullptr;
-	auto previousIt = channelActivity.find(metadata.sessionID);
-	if (previousIt != channelActivity.end()) {
-		previousActivity = &previousIt->second;
-	}
-
-	unsigned int continuityFrames = 1;
-	const double currentScore     = scorePacket(metadata, previousActivity, continuityFrames);
-
-	std::vector< const Activity * > overlappingActivities;
-	overlappingActivities.reserve(channelActivity.size());
-	for (const auto &entry : channelActivity) {
-		const Activity &activity = entry.second;
-		if (activity.sessionID == metadata.sessionID) {
-			continue;
+		if (metadata.isWhisperOrDirect) {
+			return result;
 		}
 
-		const std::int64_t age = metadata.timestampMilliseconds - activity.timestampMilliseconds;
-		if (age >= 0 && age <= OVERLAP_WINDOW_MS && activity.channelID == metadata.channelID) {
-			overlappingActivities.push_back(&activity);
-		}
-	}
-
-	if (!overlappingActivities.empty()) {
-		result.overlapDetected  = true;
-		result.overlapChannelID = metadata.channelID;
-		result.overlappingSessions.push_back(metadata.sessionID);
-		for (const Activity *activity : overlappingActivities) {
-			result.overlappingSessions.push_back(activity->sessionID);
-		}
-		std::sort(result.overlappingSessions.begin(), result.overlappingSessions.end());
-		result.overlappingSessions.erase(
-			std::unique(result.overlappingSessions.begin(), result.overlappingSessions.end()),
-			result.overlappingSessions.end());
-	}
-
-	SessionState &sessionState = m_sessionStates[metadata.sessionID];
-
-	if (!overlappingActivities.empty() && !metadata.isPrioritySpeaker) {
-		if (m_acousticConfirmationEnabled && m_acousticOracle != nullptr && metadata.payloadData != nullptr) {
-			// Gated: only sessions currently part of an overlap candidate pair get decoded,
-			// never all traffic. Both sessions in an overlapping pair independently reach
-			// this branch on their own turn through this function, so this single call
-			// (for the "current" packet's session) is sufficient to keep both sides fed.
-			m_acousticOracle->submitPacket(metadata.sessionID, metadata.codec, metadata.payloadData,
-											metadata.payloadSize, metadata.timestampMilliseconds);
+		if (metadata.isTerminator || metadata.payloadSize == 0) {
+			removeActivity(metadata);
+			return result;
 		}
 
-		const Activity *bestActivity =
-			*std::max_element(overlappingActivities.begin(), overlappingActivities.end(),
-							  [](const Activity *lhs, const Activity *rhs) { return lhs->score < rhs->score; });
+		pruneChannel(metadata.channelID, metadata.timestampMilliseconds);
+		pruneAcousticCaptureWindows(metadata.timestampMilliseconds);
 
-		const bool sameCodec = bestActivity->codec == metadata.codec;
-		const bool stronger  = bestActivity->isPrioritySpeaker || (sameCodec && isClearlyStronger(bestActivity->score, currentScore));
+		auto &channelActivity = m_activityByChannel[metadata.channelID];
+		const Activity *previousActivity = nullptr;
+		auto previousIt = channelActivity.find(metadata.sessionID);
+		if (previousIt != channelActivity.end()) {
+			previousActivity = &previousIt->second;
+		}
 
-		bool acousticConfirmed     = false;
-		bool acousticCheckRan      = false;
-		bool metadataGateTriggered = false;
+		unsigned int continuityFrames = 1;
+		const double currentScore     = scorePacket(metadata, previousActivity, continuityFrames);
 
-		if (stronger) {
-			if (sessionState.candidatePrimarySession == bestActivity->sessionID) {
-				sessionState.consecutiveWeakFrames++;
-			} else {
-				sessionState.candidatePrimarySession = bestActivity->sessionID;
-				sessionState.consecutiveWeakFrames    = 1;
-				sessionState.suppressed               = false;
+		std::vector< const Activity * > overlappingActivities;
+		overlappingActivities.reserve(channelActivity.size());
+		for (const auto &entry : channelActivity) {
+			const Activity &activity = entry.second;
+			if (activity.sessionID == metadata.sessionID) {
+				continue;
 			}
-			sessionState.releaseFrames = 0;
 
-			if (sessionState.consecutiveWeakFrames >= REQUIRED_WEAK_FRAMES) {
-				// Gate 1 (ssvr_duplicate_voice_suppression): the metadata heuristic has
-				// flagged metadata.sessionID as a candidate duplicate of bestActivity this
-				// frame. Acoustic confirmation (gate 2) is only *consulted* at this exact
-				// point, not every frame. When acoustic mode is off (or no oracle is wired),
-				// acousticConfirmed defaults to true, preserving Phase 1 behavior exactly.
-				// When gate 2 disagrees (vetoes), we intentionally do not suppress and do not
-				// reset consecutiveWeakFrames, so a transient decode hiccup on one frame
-				// doesn't discard an otherwise-valid streak -- but we still report the veto
-				// below so it's visible in real time.
-				metadataGateTriggered = true;
-				acousticConfirmed     = true;
-				if (m_acousticConfirmationEnabled && m_acousticOracle != nullptr) {
-					acousticCheckRan  = true;
-					acousticConfirmed = m_acousticOracle->isLikelySameSource(
-						bestActivity->sessionID, metadata.sessionID, metadata.timestampMilliseconds);
-				}
-
-				if (acousticConfirmed) {
-					sessionState.suppressed = true;
-					result.decision         = Decision::Suppress;
-				}
+			const std::int64_t age = metadata.timestampMilliseconds - activity.timestampMilliseconds;
+			if (age >= 0 && age <= OVERLAP_WINDOW_MS && activity.channelID == metadata.channelID) {
+				overlappingActivities.push_back(&activity);
 			}
-		} else if (sessionState.suppressed && sessionState.candidatePrimarySession != 0) {
-			sessionState.releaseFrames++;
-			if (sessionState.releaseFrames < REQUIRED_RELEASE_FRAMES) {
-				result.decision = Decision::Suppress;
-			} else {
-				sessionState = SessionState();
-			}
-		} else {
-			sessionState = SessionState();
 		}
 
-		// Report whenever gate 1 actively muted/continued-muting a stream (Suppress) OR gate
-		// 1 wanted to mute this frame but gate 2 vetoed it (metadataGateTriggered without
-		// Suppress) -- both are real-time-interesting events for operators watching the log.
-		if (result.decision == Decision::Suppress || metadataGateTriggered) {
-			result.hasDetails                 = true;
-			result.details.channelID          = metadata.channelID;
-			result.details.keptSession        = bestActivity->sessionID;
-			result.details.suppressedSession  = metadata.sessionID;
-			result.details.keptScore          = bestActivity->score;
-			result.details.suppressedScore    = currentScore;
-			result.details.candidateSessions  = { metadata.sessionID };
+		if (!overlappingActivities.empty()) {
+			result.overlapDetected  = true;
+			result.overlapChannelID = metadata.channelID;
+			result.overlappingSessions.push_back(metadata.sessionID);
 			for (const Activity *activity : overlappingActivities) {
-				result.details.candidateSessions.push_back(activity->sessionID);
+				result.overlappingSessions.push_back(activity->sessionID);
 			}
-			std::sort(result.details.candidateSessions.begin(), result.details.candidateSessions.end());
-			result.details.candidateSessions.erase(
-				std::unique(result.details.candidateSessions.begin(), result.details.candidateSessions.end()),
-				result.details.candidateSessions.end());
-
-			result.details.metadataGateTriggered = metadataGateTriggered;
-			result.details.acousticGateRan       = acousticCheckRan;
-			result.details.acousticGateConfirmed = acousticConfirmed;
-			result.details.correlationScore = acousticCheckRan ? m_acousticOracle->lastCorrelationScore() : -1.0;
-
-			// Gate 1/gate 2 outcome and correlation score are exposed as structured fields
-			// above (metadataGateTriggered/acousticGateRan/acousticGateConfirmed/
-			// correlationScore) for callers to log clearly; keep this string to the
-			// heuristic-specific diagnostic detail that isn't otherwise exposed.
-			std::ostringstream reason;
-			reason << "overlap_window_ms=" << OVERLAP_WINDOW_MS << " codec=" << codecName(metadata.codec)
-				   << " consecutive_weaker_frames=" << sessionState.consecutiveWeakFrames
-				   << " payload_size=" << metadata.payloadSize;
-			if (bestActivity->isPrioritySpeaker) {
-				reason << " kept_is_priority_speaker=true";
-			}
-			result.details.reason = reason.str();
+			std::sort(result.overlappingSessions.begin(), result.overlappingSessions.end());
+			result.overlappingSessions.erase(
+				std::unique(result.overlappingSessions.begin(), result.overlappingSessions.end()),
+				result.overlappingSessions.end());
 		}
-	} else {
-		if (sessionState.suppressed) {
-			sessionState.releaseFrames++;
-			if (sessionState.releaseFrames >= REQUIRED_RELEASE_FRAMES) {
+
+		const bool acousticEnabled = m_acousticConfirmationEnabled && m_acousticOracle != nullptr;
+		if (acousticEnabled && !overlappingActivities.empty()) {
+			const std::int64_t captureUntil = metadata.timestampMilliseconds + ACOUSTIC_CAPTURE_WINDOW_MS;
+			m_acousticCaptureUntilBySession[metadata.sessionID] = captureUntil;
+			for (const Activity *activity : overlappingActivities) {
+				m_acousticCaptureUntilBySession[activity->sessionID] =
+					std::max(m_acousticCaptureUntilBySession[activity->sessionID], captureUntil);
+			}
+		}
+
+		if (acousticEnabled && metadata.payloadData != nullptr) {
+			auto captureIt = m_acousticCaptureUntilBySession.find(metadata.sessionID);
+			if (captureIt != m_acousticCaptureUntilBySession.end()
+				&& metadata.timestampMilliseconds <= captureIt->second) {
+				acousticSubmission.oracle = m_acousticOracle;
+				acousticSubmission.sessionID = metadata.sessionID;
+				acousticSubmission.codec = metadata.codec;
+				acousticSubmission.payloadData = metadata.payloadData;
+				acousticSubmission.payloadSize = metadata.payloadSize;
+				acousticSubmission.timestampMilliseconds = metadata.timestampMilliseconds;
+			}
+		}
+
+		SessionState &sessionState = m_sessionStates[metadata.sessionID];
+
+		if (!overlappingActivities.empty() && !metadata.isPrioritySpeaker) {
+			const Activity *bestActivity =
+				*std::max_element(overlappingActivities.begin(), overlappingActivities.end(),
+								  [](const Activity *lhs, const Activity *rhs) { return lhs->score < rhs->score; });
+
+			const bool sameCodec = bestActivity->codec == metadata.codec;
+			const bool stronger  = bestActivity->isPrioritySpeaker || (sameCodec && isClearlyStronger(bestActivity->score, currentScore));
+
+			bool acousticConfirmed     = false;
+			bool acousticCheckRan      = false;
+			bool metadataGateTriggered = false;
+
+			if (stronger) {
+				if (sessionState.candidatePrimarySession == bestActivity->sessionID) {
+					sessionState.consecutiveWeakFrames++;
+				} else {
+					sessionState.candidatePrimarySession = bestActivity->sessionID;
+					sessionState.consecutiveWeakFrames    = 1;
+					sessionState.suppressed               = false;
+				}
+				sessionState.releaseFrames = 0;
+
+				if (sessionState.consecutiveWeakFrames >= REQUIRED_WEAK_FRAMES) {
+					metadataGateTriggered = true;
+					acousticConfirmed     = true;
+					if (acousticEnabled) {
+						acousticCheckRan = true;
+						acousticConfirmed = false;
+						acousticCheck.oracle = m_acousticOracle;
+						acousticCheck.keptSession = bestActivity->sessionID;
+						acousticCheck.suppressedSession = metadata.sessionID;
+						acousticCheck.timestampMilliseconds = metadata.timestampMilliseconds;
+					}
+
+					if (acousticConfirmed) {
+						sessionState.suppressed = true;
+						result.decision         = Decision::Suppress;
+					}
+				}
+			} else if (sessionState.suppressed && sessionState.candidatePrimarySession != 0) {
+				sessionState.releaseFrames++;
+				if (sessionState.releaseFrames < REQUIRED_RELEASE_FRAMES) {
+					result.decision = Decision::Suppress;
+				} else {
+					sessionState = SessionState();
+				}
+			} else {
 				sessionState = SessionState();
 			}
+
+			// Report whenever gate 1 actively muted/continued-muting a stream (Suppress)
+			// OR gate 1 wanted to mute this frame but gate 2 vetoed it (metadataGateTriggered
+			// without Suppress).
+			if (result.decision == Decision::Suppress || metadataGateTriggered) {
+				result.hasDetails                 = true;
+				result.details.channelID          = metadata.channelID;
+				result.details.keptSession        = bestActivity->sessionID;
+				result.details.suppressedSession  = metadata.sessionID;
+				result.details.keptScore          = bestActivity->score;
+				result.details.suppressedScore    = currentScore;
+				result.details.candidateSessions  = { metadata.sessionID };
+				for (const Activity *activity : overlappingActivities) {
+					result.details.candidateSessions.push_back(activity->sessionID);
+				}
+				std::sort(result.details.candidateSessions.begin(), result.details.candidateSessions.end());
+				result.details.candidateSessions.erase(
+					std::unique(result.details.candidateSessions.begin(), result.details.candidateSessions.end()),
+					result.details.candidateSessions.end());
+
+				result.details.metadataGateTriggered = metadataGateTriggered;
+				result.details.acousticGateRan       = acousticCheckRan;
+				result.details.acousticGateConfirmed = acousticConfirmed;
+				result.details.correlationScore      = -1.0;
+
+				std::ostringstream reason;
+				reason << "overlap_window_ms=" << OVERLAP_WINDOW_MS << " codec=" << codecName(metadata.codec)
+					   << " consecutive_weaker_frames=" << sessionState.consecutiveWeakFrames
+					   << " payload_size=" << metadata.payloadSize;
+				if (bestActivity->isPrioritySpeaker) {
+					reason << " kept_is_priority_speaker=true";
+				}
+				result.details.reason = reason.str();
+			}
 		} else {
-			sessionState = SessionState();
+			if (sessionState.suppressed) {
+				sessionState.releaseFrames++;
+				if (sessionState.releaseFrames >= REQUIRED_RELEASE_FRAMES) {
+					sessionState = SessionState();
+				}
+			} else {
+				sessionState = SessionState();
+			}
+		}
+
+		updateActivity(metadata, currentScore, continuityFrames);
+	}
+
+	if (acousticSubmission.oracle != nullptr) {
+		acousticSubmission.oracle->submitPacket(acousticSubmission.sessionID, acousticSubmission.codec,
+												acousticSubmission.payloadData, acousticSubmission.payloadSize,
+												acousticSubmission.timestampMilliseconds);
+	}
+
+	if (acousticCheck.oracle != nullptr) {
+		const bool acousticConfirmed = acousticCheck.oracle->isLikelySameSource(
+			acousticCheck.keptSession, acousticCheck.suppressedSession, acousticCheck.timestampMilliseconds);
+		const double correlationScore = acousticCheck.oracle->lastCorrelationScore();
+
+		result.details.acousticGateConfirmed = acousticConfirmed;
+		result.details.correlationScore      = correlationScore;
+
+		if (acousticConfirmed) {
+			std::lock_guard< std::mutex > lock(m_mutex);
+			SessionState &sessionState = m_sessionStates[acousticCheck.suppressedSession];
+			if (sessionState.candidatePrimarySession == acousticCheck.keptSession
+				&& sessionState.consecutiveWeakFrames >= REQUIRED_WEAK_FRAMES) {
+				sessionState.suppressed = true;
+				result.decision = Decision::Suppress;
+			}
 		}
 	}
 
-	updateActivity(metadata, currentScore, continuityFrames);
 	return result;
 }
 
@@ -235,6 +291,16 @@ void DuplicateVoiceSuppressor::pruneChannel(unsigned int channelID, std::int64_t
 
 	if (channelActivity.empty()) {
 		m_activityByChannel.erase(channelIt);
+	}
+}
+
+void DuplicateVoiceSuppressor::pruneAcousticCaptureWindows(std::int64_t nowMilliseconds) {
+	for (auto it = m_acousticCaptureUntilBySession.begin(); it != m_acousticCaptureUntilBySession.end();) {
+		if (nowMilliseconds > it->second) {
+			it = m_acousticCaptureUntilBySession.erase(it);
+		} else {
+			++it;
+		}
 	}
 }
 
@@ -263,6 +329,7 @@ void DuplicateVoiceSuppressor::removeActivity(const PacketMetadata &metadata) {
 		}
 	}
 	m_sessionStates.erase(metadata.sessionID);
+	m_acousticCaptureUntilBySession.erase(metadata.sessionID);
 }
 
 double DuplicateVoiceSuppressor::scorePacket(const PacketMetadata &metadata, const Activity *previousActivity,
